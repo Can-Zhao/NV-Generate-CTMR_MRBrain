@@ -65,6 +65,7 @@ from diff_model_train_list_jsons import (
     generate_validation_images_for_modalities,
     log_validation_images_to_tensorboard,
     SAVE_EPOCH_INTERVAL,
+    VAL_INTERVAL,
 )
 
 # Max iterations per epoch for by_size bucketing
@@ -361,6 +362,42 @@ def diff_model_train(
 
     logger.info(f"Using {device} of {world_size}")
     
+    # Check autoencoder file early if validation is enabled (only check once at startup)
+    args.validation_enabled = False
+    
+    if local_rank == 0:
+        autoencoder_path = getattr(args, 'trained_autoencoder_path', None)
+        if not autoencoder_path:
+            logger.warning("=" * 80)
+            logger.warning("⚠️  VALIDATION IMAGE GENERATION DISABLED ⚠️")
+            logger.warning("=" * 80)
+            logger.warning("Reason: Autoencoder path not configured in config file")
+            logger.warning("Validation image generation requires the autoencoder model.")
+            logger.warning("Please set 'trained_autoencoder_path' in your config.")
+            logger.warning("Validation will be skipped for all epochs.")
+            logger.warning("=" * 80)
+            args.validation_enabled = False
+        elif not os.path.exists(autoencoder_path):
+            logger.warning("=" * 80)
+            logger.warning("⚠️  VALIDATION IMAGE GENERATION DISABLED ⚠️")
+            logger.warning("=" * 80)
+            logger.warning(f"Reason: Autoencoder file not found: {autoencoder_path}")
+            logger.warning("Validation image generation requires the autoencoder model.")
+            logger.warning("Please ensure the autoencoder checkpoint exists before running validation.")
+            logger.warning("Validation will be skipped for all epochs.")
+            logger.warning("=" * 80)
+            args.validation_enabled = False
+        else:
+            # Autoencoder file exists - validation enabled
+            args.validation_enabled = True
+            logger.info(f"Autoencoder file found: {autoencoder_path} (validation will run every {VAL_INTERVAL} epochs)")
+    
+    # Broadcast validation_enabled to all ranks in distributed training
+    if dist.is_initialized():
+        validation_enabled_tensor = torch.tensor([1 if args.validation_enabled else 0], dtype=torch.int, device=device)
+        dist.broadcast(validation_enabled_tensor, src=0)
+        args.validation_enabled = bool(validation_enabled_tensor.item())
+    
     tensorboard_writer = None
     if local_rank == 0:
         tensorboard_path = args.tfevent_dir
@@ -553,7 +590,8 @@ def diff_model_train(
                 )
                 logger.info(f"Saved periodic checkpoint: {epoch_filename}")
             
-            if VALIDATION_AVAILABLE and (epoch + 1) % 50 == 0:
+            # Generate and log validation images every VAL_INTERVAL epochs (only if validation is enabled)
+            if args.validation_enabled and (epoch + 1) % VAL_INTERVAL == 0:
                 logger.info(f"Generating validation images at epoch {epoch + 1}...")
                 
                 generated_images = generate_validation_images_for_modalities(
