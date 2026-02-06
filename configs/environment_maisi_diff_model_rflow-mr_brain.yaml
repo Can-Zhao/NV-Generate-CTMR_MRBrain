@@ -1,0 +1,56 @@
+# ==============================================================================
+# Environment Configuration for Diffusion Model Training (MR-RATE, AOMIC, QTIM)
+# ==============================================================================
+
+# Data Directories
+# ------------------------------------------------------------------------------
+
+data_base_dir: /lustre/fsw/portfolios/healthcareeng/users/canz/code/NV-Generate-CTMR_MRbrain/data
+
+# VAE-encoded embedding directories (must match json_data_list order)
+embedding_base_dir:
+- /lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_monai/MAISI/data/encoding_128_downsample/MR-Rate/nvidia_1000_mri_skull_stripped/
+- /lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_monai/MAISI/data/encoding_128_downsample/aomic_skull_stripped/
+- /lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_monai/MAISI/data/encoding_128_downsample/qtim_skull_stripped/
+
+# JSON files with training/testing splits (must match embedding_base_dir order)
+json_data_list:
+- /lustre/fsw/portfolios/healthcareeng/users/canz/code/NV-Generate-CTMR_MRbrain/jsons/dataset_MR-RATE_0_emb.json
+- /lustre/fsw/portfolios/healthcareeng/users/canz/code/NV-Generate-CTMR_MRbrain/jsons/dataset_aomic_skull_stripped_0_emb.json
+- /lustre/fsw/portfolios/healthcareeng/users/canz/code/NV-Generate-CTMR_MRbrain/jsons/dataset_qtim_skull_stripped_0_emb.json
+
+# Model Files
+# ------------------------------------------------------------------------------
+
+# Directory for model checkpoints
+model_dir: /lustre/fsw/portfolios/healthcareeng/users/canz/code/NV-Generate-CTMR_MRbrain/models
+
+# Checkpoint filename (.pt for PyTorch, .safetensors for SafeTensors format)
+# .pt: Single file (~2GB)
+# .safetensors: Two files (~1.5GB + 500MB), secure, faster
+#               Requires: pip install safetensors
+# To switch: change model_filename extension
+model_filename: diff_unet_3d_rflow-mr_brain.safetensors
+
+# Existing checkpoint to resume from (null to start fresh)
+existing_ckpt_filepath: /lustre/fsw/portfolios/healthcareeng/users/canz/code/NV-Generate-CTMR_MRbrain/models/diff_unet_3d_rflow-mr_brain.safetensors
+
+# Path to the pre-trained autoencoder (VAE) model
+# - autoencoder_v1.pt: First version (Apache 2.0 license)
+# - autoencoder_v2.pt: Second version (CC-BY-NC-SA 4.0 license)
+trained_autoencoder_path: /lustre/fsw/portfolios/healthcareeng/users/canz/code/NV-Generate-CTMR_MRbrain/models/autoencoder_v1.pt
+
+
+
+# Output Directories
+# ------------------------------------------------------------------------------
+
+output_dir: /lustre/fsw/portfolios/healthcareeng/users/canz/code/NV-Generate-CTMR_MRbrain/output
+tfevent_dir: /lustre/fsw/portfolios/healthcareeng/users/canz/code/NV-Generate-CTMR_MRbrain/tfevent
+output_prefix: unet_3d
+
+# Modality Mapping
+# ------------------------------------------------------------------------------
+
+# JSON mapping modality names to IDs (e.g., {"mri_t1": 9, "mri_t2": 10, ...})
+modality_mapping_path: /lustre/fsw/portfolios/healthcareeng/users/canz/code/NV-Generate-CTMR_MRbrain/configs/modality_mapping.json

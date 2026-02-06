@@ -1,0 +1,118 @@
+# ==============================================================================
+# Diffusion Model Training Configuration
+# ==============================================================================
+# This file contains hyperparameters for training and inference of the 
+# diffusion model for MRI brain image generation using Rectified Flow.
+
+# Training Configuration
+# ------------------------------------------------------------------------------
+diffusion_unet_train:
+  # Batch size per GPU
+  # - **IMPORTANT**: Must be 1 when training with mixed image dimensions
+  #   (e.g., [128,128,128], [256,256,128], [256,256,256] in the same batch)
+  # - Different image sizes cannot be batched together in PyTorch
+  # - If using --image_dim to filter to a single size, can increase to >1
+  # - For bucketed data parallel training with diff_model_train_list_jsons_bucketed_parallel.py, this is the BASE batch size, use 24 for 80G GPU (auto-adjusted per GPU)
+  # - Effective batch size = batch_size × num_GPUs
+  batch_size: 96
+  
+  # Cache rate for data loading (0.0 to 1.0)
+  # - 0.0: No caching (saves memory, slower)
+  # - 1.0: Cache all data (faster, uses more memory)
+  # - Recommended: 0.0 for large datasets to save memory
+  cache_rate: 0
+  
+  # Learning rate for AdamW optimizer
+  # - Typical range: 1e-5 to 1e-4 for diffusion models
+  lr: 1.0e-05
+  
+  # Number of training epochs
+  # - Diffusion models typically need 500-2000 epochs
+  n_epochs: 1000
+  
+  # Weighted random sampling based on modality distribution
+  # - true: Underrepresented modalities are sampled more frequently
+  #         This helps balance learning across all MRI types
+  # - false: Uniform random sampling (common modalities dominate)
+  # - Recommended: true for imbalanced datasets
+  use_weighted_sampling: true
+  
+  # Filter training data by image dimension [x, y, z]
+  # - Only embeddings with this exact image dimension will be used for training
+  # - This allows training with batch_size > 1 (since all images are same size)
+  # - Set to null to use all dimensions (requires batch_size: 1)
+  # - Example: [128, 128, 128] for 128³ images only
+  # - Example: [256, 256, 128] for 256×256×128 images only
+  # - Note: This is configured ONLY in this file (not available as command-line arg)
+  image_dim: 
+  - 128
+  - 128
+  - 128
+
+# Inference Configuration
+# ------------------------------------------------------------------------------
+diffusion_unet_inference:
+  # Output volume dimensions [depth, height, width] in pixels
+  # - Must match one of the training dimensions for best results
+  # - Example: [128, 256, 256] for brain MRI
+  dim:
+  - 128
+  - 128
+  - 128
+  
+  # Output voxel spacing [z, y, x] in millimeters
+  # - Controls the physical size of the generated image
+  # - Example: [1.25, 1.0, 1.0] means 1.25mm slices, 1mm in-plane
+  spacing:
+  - 1.507812
+  - 1.789062
+  - 1.507812
+  
+  # Top region index for body region conditioning
+  # - 4-element vector [head, chest, abdomen, pelvis]
+  # - 1 = include this region, 0 = exclude
+  # - Example: [0, 1, 0, 0] = chest only
+  # - Note: For brain MRI, typically use [0, 0, 0, 0] (not used)
+  top_region_index:
+  - 0
+  - 1
+  - 0
+  - 0
+  
+  # Bottom region index for body region conditioning
+  # - 4-element vector [head, chest, abdomen, pelvis]
+  # - 1 = include this region, 0 = exclude
+  # - Example: [0, 0, 1, 0] = abdomen only
+  # - Note: For brain MRI, typically use [0, 0, 0, 0] (not used)
+  bottom_region_index:
+  - 0
+  - 0
+  - 1
+  - 0
+  
+  # Random seed for reproducibility
+  # - Set to a fixed value (e.g., 0) for reproducible results
+  # - Set to -1 or omit for random seed
+  random_seed: 0
+  
+  # Number of diffusion sampling steps during inference
+  # - More steps = higher quality but slower
+  # - Typical range: 20-100
+  # - Recommended: 30 for good quality/speed tradeoff
+  # - Rectified Flow can use fewer steps than DDPM
+  num_inference_steps: 30
+  
+  # Modality conditioning for generation
+  # - Integer ID corresponding to MRI type (see modality_mapping.json)
+  modality: [9, 10, 11, 16, 17, 18, 19]
+  
+  # Classifier-free guidance scale for conditional generation
+  # - Controls how strongly the model follows the conditioning
+  # - Range: 0.0 to 20.0
+  #   0.0: No guidance (unconditional generation)
+  #   1.0: Neutral guidance
+  #   5-10: Moderate guidance (recommended)
+  #   15+: Strong guidance (may reduce diversity)
+  # - Higher values = more faithful to condition, less diverse
+  # - Lower values = more diverse, less faithful to condition
+  cfg_guidance_scale: 15

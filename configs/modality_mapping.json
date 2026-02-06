@@ -12,5 +12,7 @@
     "mri_adc":14,
     "mri_ssfp":15,
     "mri_mra":16,
-    "mri_t1c":17
+    "mri_t1c":17,
+    "mri_t2c":18,
+    "mri_flairc":19
 }

@@ -731,3 +731,376 @@ def dynamic_infer(inferer, model, images):
         output = inferer(network=model, inputs=images)
         inferer.roi_size = orig_roi
         return output
+
+
+def load_checkpoint(
+    checkpoint_path: str,
+    unet: torch.nn.Module,
+    device: torch.device,
+    logger: logging.Logger,
+    strict: bool = False
+) -> tuple:
+    """
+    Load checkpoint and apply it to an existing UNet model.
+    
+    Automatically detects checkpoint format (PyTorch .pt or SafeTensors .safetensors)
+    and uses the appropriate loading function.
+    
+    This is a general-purpose checkpoint loading function that can be used
+    with any model architecture. The model must be created separately by the caller.
+
+    Args:
+        checkpoint_path (str): Path to the checkpoint file. If None or doesn't exist,
+                               returns (unet, None, 0, None, None).
+        unet (torch.nn.Module): Pre-instantiated UNet model to load weights into.
+                                Can be wrapped in DDP or not.
+        device (torch.device): Device to load the checkpoint on.
+        logger (logging.Logger): Logger for logging information.
+        strict (bool): Whether to strictly enforce that the keys in checkpoint_unet
+                       match the keys returned by the model's state_dict(). Default: False.
+
+    Returns:
+        tuple: (unet, scale_factor, start_epoch, optimizer_state_dict, scheduler_state_dict)
+            - unet: Model with loaded weights
+            - scale_factor: Data scaling factor from checkpoint (or None)
+            - start_epoch: Epoch to resume from (0 if training from scratch)
+            - optimizer_state_dict: Optimizer state from checkpoint (or None)
+            - scheduler_state_dict: LR scheduler state from checkpoint (or None)
+    """
+    if checkpoint_path is None:
+        logger.info("No checkpoint path provided. Training from scratch.")
+        return unet, None, 0, None, None
+    
+    if not os.path.exists(checkpoint_path):
+        logger.info(f"Checkpoint file {checkpoint_path} does not exist. Training from scratch.")
+        return unet, None, 0, None, None
+    
+    # Auto-detect checkpoint format
+    if checkpoint_path.endswith('.safetensors'):
+        logger.info("Detected SafeTensors format checkpoint.")
+        return load_checkpoint_safetensors(checkpoint_path, unet, device, logger, strict)
+    elif checkpoint_path.endswith('.pt'):
+        logger.info("Detected PyTorch pickle format checkpoint.")
+        return load_checkpoint_pytorch(checkpoint_path, unet, device, logger, strict)
+    else:
+        # Try SafeTensors first (check if .safetensors file exists)
+        safetensors_path = checkpoint_path + '.safetensors' if not checkpoint_path.endswith('.safetensors') else checkpoint_path
+        if os.path.exists(safetensors_path):
+            logger.info("Detected SafeTensors format checkpoint.")
+            return load_checkpoint_safetensors(safetensors_path, unet, device, logger, strict)
+        else:
+            # Default to PyTorch format
+            logger.info("Assuming PyTorch pickle format checkpoint.")
+            return load_checkpoint_pytorch(checkpoint_path, unet, device, logger, strict)
+
+
+def load_checkpoint_pytorch(
+    checkpoint_path: str,
+    unet: torch.nn.Module,
+    device: torch.device,
+    logger: logging.Logger,
+    strict: bool = False
+) -> tuple:
+    """
+    Load checkpoint from PyTorch pickle format (.pt).
+    
+    This is the traditional PyTorch checkpoint loading.
+    """
+    logger.info(f"Loading checkpoint from {checkpoint_path}...")
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    
+    # Load model weights
+    is_ddp = isinstance(unet, torch.nn.parallel.DistributedDataParallel)
+    if is_ddp:
+        unet.module.load_state_dict(checkpoint["unet_state_dict"], strict=strict)
+    else:
+        unet.load_state_dict(checkpoint["unet_state_dict"], strict=strict)
+    
+    logger.info(f"Model weights loaded from checkpoint.")
+    
+    # Load scale factor
+    scale_factor = checkpoint.get("scale_factor", None)
+    if scale_factor is not None:
+        logger.info(f"scale_factor -> {scale_factor}.")
+    
+    # Load start epoch
+    start_epoch = 0
+    try:
+        if checkpoint.get("epoch_finished", True):
+            start_epoch = checkpoint["epoch"]
+        else:
+            start_epoch = checkpoint["epoch"] - 1
+    except KeyError:
+        start_epoch = 0
+    
+    logger.info(f"Resuming from epoch {start_epoch}.")
+    
+    # Load optimizer state
+    optimizer_state_dict = checkpoint.get("optimizer_state_dict", None)
+    if optimizer_state_dict is not None:
+        logger.info("Optimizer state found in checkpoint.")
+    
+    # Load scheduler state
+    scheduler_state_dict = checkpoint.get("scheduler_state_dict", None)
+    if scheduler_state_dict is not None:
+        logger.info("Scheduler state found in checkpoint.")
+
+    return unet, scale_factor, start_epoch, optimizer_state_dict, scheduler_state_dict
+
+
+def load_checkpoint_safetensors(
+    checkpoint_path: str,
+    unet: torch.nn.Module,
+    device: torch.device,
+    logger: logging.Logger,
+    strict: bool = False
+) -> tuple:
+    """
+    Load checkpoint from hybrid SafeTensors + PyTorch format.
+    
+    Loads:
+    - Model weights from .safetensors file
+    - Training state from _training_state.pt file
+    
+    This is much simpler than saving everything in SafeTensors!
+    """
+    try:
+        from safetensors.torch import load_file
+    except ImportError:
+        raise ImportError(
+            "safetensors library not found. Install with: pip install safetensors\n"
+            "Or use PyTorch format checkpoints (.pt) instead."
+        )
+    
+    logger.info(f"Loading SafeTensors checkpoint from {checkpoint_path}...")
+    
+    # 1. Load model weights from SafeTensors file
+    model_state_dict = load_file(checkpoint_path, device=str(device))
+    
+    # Load model weights
+    is_ddp = isinstance(unet, torch.nn.parallel.DistributedDataParallel)
+    if is_ddp:
+        unet.module.load_state_dict(model_state_dict, strict=strict)
+    else:
+        unet.load_state_dict(model_state_dict, strict=strict)
+    
+    logger.info(f"Model weights loaded from SafeTensors checkpoint.")
+    
+    # 2. Load training state from PyTorch file
+    if checkpoint_path.endswith('.safetensors'):
+        training_state_path = checkpoint_path.replace('.safetensors', '_training_state.pt')
+    else:
+        training_state_path = checkpoint_path + '_training_state.pt'
+    
+    if not os.path.exists(training_state_path):
+        logger.warning(f"Training state file not found: {training_state_path}. Starting from epoch 0.")
+        return unet, None, 0, None, None
+    
+    training_state = torch.load(training_state_path, map_location=device, weights_only=False)
+    
+    # Extract training state
+    scale_factor = training_state.get("scale_factor", None)
+    if scale_factor is not None:
+        logger.info(f"scale_factor -> {scale_factor}.")
+    
+    # Load start epoch
+    start_epoch = 0
+    try:
+        if training_state.get("epoch_finished", True):
+            start_epoch = training_state.get("epoch", 0)
+        else:
+            start_epoch = training_state.get("epoch", 0) - 1
+    except (KeyError, TypeError):
+        start_epoch = 0
+    
+    logger.info(f"Resuming from epoch {start_epoch}.")
+    
+    # Load optimizer state
+    optimizer_state_dict = training_state.get("optimizer_state_dict", None)
+    if optimizer_state_dict is not None:
+        logger.info("Optimizer state found in checkpoint.")
+    
+    # Load scheduler state
+    scheduler_state_dict = training_state.get("scheduler_state_dict", None)
+    if scheduler_state_dict is not None:
+        logger.info("Scheduler state found in checkpoint.")
+
+    return unet, scale_factor, start_epoch, optimizer_state_dict, scheduler_state_dict
+
+
+def save_checkpoint(
+    epoch: int,
+    unet: torch.nn.Module,
+    loss_torch_epoch: float,
+    num_train_timesteps: int,
+    scale_factor: Tensor,
+    ckpt_folder: str,
+    model_filename: str,
+    optimizer: torch.optim.Optimizer = None,
+    scheduler: torch.optim.lr_scheduler._LRScheduler = None,
+    epoch_finished: bool = True,
+) -> None:
+    """
+    Save checkpoint with full training state for seamless resumption.
+    
+    Automatically detects format from filename extension:
+    - .pt → PyTorch pickle format (single file)
+    - .safetensors → SafeTensors format (model weights + training state)
+    
+    Format Details:
+    ---------------
+    PyTorch (.pt):
+        - Single file containing everything (model + optimizer + scheduler + metadata)
+        - Uses pickle (standard PyTorch format)
+        - Example: model.pt, model_epoch200.pt
+    
+    SafeTensors (.safetensors + _training_state.pt):
+        - Model weights in .safetensors file (secure, fast, no pickle)
+        - Training state in _training_state.pt file (optimizer, scheduler, metadata)
+        - Hybrid approach: best of both worlds!
+        - Example: model.safetensors + model_training_state.pt
+
+    Args:
+        epoch (int): Current epoch number.
+        unet (torch.nn.Module): UNet model.
+        loss_torch_epoch (float): Training loss for the epoch.
+        num_train_timesteps (int): Number of training timesteps.
+        scale_factor (Tensor): Scaling factor.
+        ckpt_folder (str): Checkpoint folder path.
+        model_filename (str): Model filename (.pt for PyTorch, .safetensors for SafeTensors).
+        optimizer (torch.optim.Optimizer): Optimizer (for resuming training).
+        scheduler (torch.optim.lr_scheduler._LRScheduler): Learning rate scheduler.
+        epoch_finished (bool): Whether the epoch is finished.
+    """
+    # Auto-detect format from filename extension
+    if model_filename.endswith('.safetensors'):
+        save_checkpoint_safetensors(
+            epoch, unet, loss_torch_epoch, num_train_timesteps, scale_factor,
+            ckpt_folder, model_filename, optimizer, scheduler, epoch_finished
+        )
+    else:
+        # Default to PyTorch format for .pt or any other extension
+        save_checkpoint_pytorch(
+            epoch, unet, loss_torch_epoch, num_train_timesteps, scale_factor,
+            ckpt_folder, model_filename, optimizer, scheduler, epoch_finished
+        )
+
+
+def save_checkpoint_pytorch(
+    epoch: int,
+    unet: torch.nn.Module,
+    loss_torch_epoch: float,
+    num_train_timesteps: int,
+    scale_factor: Tensor,
+    ckpt_folder: str,
+    model_filename: str,
+    optimizer: torch.optim.Optimizer = None,
+    scheduler: torch.optim.lr_scheduler._LRScheduler = None,
+    epoch_finished: bool = True,
+) -> None:
+    """
+    Save checkpoint using PyTorch's pickle format (.pt).
+    
+    This is the traditional PyTorch checkpoint format.
+    - Pros: Standard, widely supported, saves any Python object
+    - Cons: Uses pickle (security risk), slower loading, larger files
+    """
+    unet_state_dict = unet.module.state_dict() if dist.is_initialized() else unet.state_dict()
+    
+    to_save_dict = {
+        "epoch": epoch + 1,
+        "loss": loss_torch_epoch,
+        "num_train_timesteps": num_train_timesteps,
+        "scale_factor": scale_factor,
+        "unet_state_dict": unet_state_dict,
+        "epoch_finished": epoch_finished,
+    }
+    
+    # Save optimizer state
+    if optimizer is not None:
+        to_save_dict["optimizer_state_dict"] = optimizer.state_dict()
+    else:
+        to_save_dict["optimizer_state_dict"] = None
+    
+    # Save scheduler state
+    if scheduler is not None:
+        to_save_dict["scheduler_state_dict"] = scheduler.state_dict()
+    
+    torch.save(to_save_dict, f"{ckpt_folder}/{model_filename}")
+
+
+def save_checkpoint_safetensors(
+    epoch: int,
+    unet: torch.nn.Module,
+    loss_torch_epoch: float,
+    num_train_timesteps: int,
+    scale_factor: Tensor,
+    ckpt_folder: str,
+    model_filename: str,
+    optimizer: torch.optim.Optimizer = None,
+    scheduler: torch.optim.lr_scheduler._LRScheduler = None,
+    epoch_finished: bool = True,
+) -> None:
+    """
+    Save checkpoint using hybrid SafeTensors + PyTorch format.
+    
+    This is a simplified hybrid approach:
+    - Model weights → .safetensors file (secure, fast, no pickle)
+    - Training state → .pt file (optimizer, scheduler, metadata)
+    
+    Benefits:
+    - Simple implementation (no complex tensor/metadata splitting)
+    - Model weights are secure and fast to load
+    - Training state can be easily resumed
+    - Model weights can be shared without optimizer bloat
+    """
+    try:
+        from safetensors.torch import save_file
+    except ImportError:
+        raise ImportError(
+            "safetensors library not found. Install with: pip install safetensors\n"
+            "Falling back to PyTorch format is recommended if safetensors is not available."
+        )
+    
+    # Get model state dict
+    unet_state_dict = unet.module.state_dict() if dist.is_initialized() else unet.state_dict()
+    
+    # Determine filenames based on input
+    if model_filename.endswith('.safetensors'):
+        # Already has .safetensors extension, use as-is
+        safetensors_filename = model_filename
+        training_state_filename = model_filename.replace('.safetensors', '_training_state.pt')
+    elif model_filename.endswith('.pt'):
+        # Convert .pt to .safetensors
+        safetensors_filename = model_filename.replace('.pt', '.safetensors')
+        training_state_filename = model_filename.replace('.pt', '_training_state.pt')
+    else:
+        # No recognized extension, add .safetensors
+        safetensors_filename = model_filename + '.safetensors'
+        training_state_filename = model_filename + '_training_state.pt'
+    
+    # 1. Save model weights in SafeTensors format (simple!)
+    safetensors_path = f"{ckpt_folder}/{safetensors_filename}"
+    save_file(unet_state_dict, safetensors_path)
+    
+    # 2. Save training state in PyTorch format (simple!)
+    training_state = {
+        "epoch": epoch + 1,
+        "loss": loss_torch_epoch,
+        "num_train_timesteps": num_train_timesteps,
+        "scale_factor": scale_factor,
+        "epoch_finished": epoch_finished,
+    }
+    
+    # Add optimizer state if available
+    if optimizer is not None:
+        training_state["optimizer_state_dict"] = optimizer.state_dict()
+    else:
+        training_state["optimizer_state_dict"] = None
+    
+    # Add scheduler state if available
+    if scheduler is not None:
+        training_state["scheduler_state_dict"] = scheduler.state_dict()
+    
+    training_state_path = f"{ckpt_folder}/{training_state_filename}"
+    torch.save(training_state, training_state_path)
