@@ -164,3 +164,4 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     download_model_data(args.version, args.root_dir, args.model_only)
+    
