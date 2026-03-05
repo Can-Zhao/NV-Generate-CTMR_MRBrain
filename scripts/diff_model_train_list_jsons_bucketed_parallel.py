@@ -49,16 +49,17 @@ from torch.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.tensorboard import SummaryWriter
 
-from diff_model_setting import initialize_distributed, load_config, setup_logging
-from utils import define_instance, load_checkpoint, save_checkpoint
+from .diff_model_setting import initialize_distributed, load_config, setup_logging
+from .utils import define_instance, load_checkpoint, load_unet, save_checkpoint
 
 # Import reusable functions from diff_model_train_list_jsons
-from diff_model_train_list_jsons import (
-    augment_modality_label,
-    load_unet,
+from .diff_model_train_list_jsons import (
     load_filenames,
     prepare_data,
     calculate_scale_factor,
+    setup_validation,
+    filter_existing_files,
+    compute_modality_weights,
     create_optimizer,
     create_lr_scheduler,
     train_one_epoch,
@@ -68,11 +69,8 @@ from diff_model_train_list_jsons import (
     VAL_INTERVAL,
 )
 
-# Max iterations per epoch for by_size bucketing
-MAX_ITER = 50  # Balanced training across image sizes
-
-# Reference image size for batch size calculation (256x256x128)
-REFERENCE_SIZE_PRODUCT = 256 * 256 * 128
+# Reference image size for batch size calculation (128x128x128)
+REFERENCE_SIZE_PRODUCT = 128 * 128 * 128
 
 
 def analyze_data_distribution(
@@ -113,7 +111,7 @@ def analyze_data_distribution(
         # Calculate batch size (same formula as before)
         batch_size = int(base_batch_size * REFERENCE_SIZE_PRODUCT / size_product)
         batch_size = max(batch_size, 1)
-        batch_size = min(batch_size, 32)
+        batch_size = min(batch_size, 96)
         
         num_batches = math.ceil(float(count) / batch_size)
         
@@ -134,106 +132,173 @@ def analyze_data_distribution(
     return dim_info
 
 
+def _compute_size_list(dim_info: dict, world_size: int) -> list:
+    """
+    Pure allocation logic: compute size_list (one entry per GPU) from dim_info.
+
+    Strategy:
+      - If num_dimensions > world_size: select the top `world_size` dimensions by
+        num_batches (one GPU each).
+      - If num_dimensions <= world_size: proportionally allocate GPUs to dimensions
+        using a greedy "most-loaded first" algorithm.  Each dimension starts with 1
+        GPU; the remaining GPUs are awarded one-by-one to whichever dimension currently
+        has the highest batches-per-GPU ratio.  This distributes ALL GPUs and achieves
+        near-optimal load balance.
+
+    Args:
+        dim_info (dict): {dim_str: {'num_batches': int, 'size_product': int, ...}}
+        world_size (int): Total number of GPUs.
+
+    Returns:
+        list: Sorted list of dim strings, length == world_size.
+              Dimensions that receive multiple GPUs appear multiple times.
+    """
+    num_dimensions = len(dim_info)
+
+    if num_dimensions > world_size:
+        # One GPU per dimension, pick the busiest world_size dims
+        sorted_by_batches = sorted(dim_info.items(), key=lambda x: -x[1]['num_batches'])
+        size_list = [dim_str for dim_str, _ in sorted_by_batches[:world_size]]
+    else:
+        # Proportional allocation: every GPU is assigned a real dimension
+        # Start each dimension with 1 GPU
+        gpu_counts = {dim_str: 1 for dim_str in dim_info}
+        remaining = world_size - num_dimensions
+
+        # Greedily add GPUs to the most-loaded dimension (highest batches/GPU)
+        while remaining > 0:
+            most_loaded = max(
+                dim_info.keys(),
+                key=lambda d: dim_info[d]['num_batches'] / gpu_counts[d],
+            )
+            gpu_counts[most_loaded] += 1
+            remaining -= 1
+
+        # Build size_list by repeating each dim_str gpu_counts[dim_str] times
+        size_list = []
+        for dim_str in sorted(gpu_counts.keys()):  # sorted for determinism
+            size_list.extend([dim_str] * gpu_counts[dim_str])
+
+    size_list.sort()
+    return size_list
+
+
 def distribute_dimensions_across_gpus(
     dim_info: dict,
     world_size: int,
     logger: logging.Logger,
 ) -> list:
     """
-    Distribute dimensions across GPUs to balance number of batches per GPU.
-    
-    If num_dimensions > num_gpus: Select top dimensions by sample count.
-    If num_dimensions <= num_gpus: Use greedy algorithm to balance batches.
-    
+    Distribute dimensions across GPUs to balance number of batches per GPU,
+    and log the resulting assignment.
+
+    Uses :func:`_compute_size_list` for the allocation logic.
+
     Args:
         dim_info (dict): Dimension info from analyze_data_distribution.
         world_size (int): Total number of GPUs.
         logger (logging.Logger): Logger.
-    
+
     Returns:
-        list: Size list for each GPU (length = world_size)
+        list: Sorted size list for each GPU (length = world_size).
     """
     num_dimensions = len(dim_info)
-    
+    size_list = _compute_size_list(dim_info, world_size)
+
     if num_dimensions > world_size:
-        # More dimensions than GPUs: Pick top dimensions by num_batches
         logger.info(f"[bucketed_parallel] {num_dimensions} dimensions > {world_size} GPUs")
         logger.info(f"[bucketed_parallel] Selecting top {world_size} dimensions by num_batches")
-        
-        # Sort by num_batches (number of batches) descending
-        sorted_by_batches = sorted(dim_info.items(), key=lambda x: -x[1]['num_batches'])
-        selected_dims = [dim_str for dim_str, _ in sorted_by_batches[:world_size]]
-        
-        # Create size_list (one dimension per GPU)
-        size_list = selected_dims
-        
-        # Log what was selected and what was skipped
-        logger.info(f"[bucketed_parallel] Selected dimensions:")
-        for i, dim_str in enumerate(selected_dims):
+
+        logger.info(f"[bucketed_parallel] Selected dimensions (1 GPU each):")
+        for i, dim_str in enumerate(size_list):
             info = dim_info[dim_str]
             logger.info(f"  GPU {i}: {dim_str} - {info['count']} files, {info['num_batches']} batches")
-        
-        skipped_dims = [dim_str for dim_str, _ in sorted_by_batches[world_size:]]
-        if skipped_dims:
+
+        # Warn about skipped dimensions
+        selected_set = set(size_list)
+        skipped = [d for d in dim_info if d not in selected_set]
+        if skipped:
             logger.warning(f"[bucketed_parallel] Skipped dimensions (too few GPUs):")
-            for dim_str in skipped_dims:
+            for dim_str in skipped:
                 info = dim_info[dim_str]
                 logger.warning(f"  {dim_str}: {info['count']} files, {info['num_batches']} batches")
-        
-        # Calculate balance metrics
-        selected_batches = [dim_info[dim_str]['num_batches'] for dim_str in selected_dims]
-        avg_batches = sum(selected_batches) / len(selected_batches)
-        max_imbalance = max(abs(b - avg_batches) for b in selected_batches)
-        logger.info(f"[bucketed_parallel] Balance: avg={avg_batches:.1f} batches/GPU, max_imbalance={max_imbalance:.1f}")
-        
+
+        batches_per_gpu = [dim_info[d]['num_batches'] for d in size_list]
+        avg = sum(batches_per_gpu) / len(batches_per_gpu)
+        max_imbalance = max(abs(b - avg) for b in batches_per_gpu)
+        logger.info(f"[bucketed_parallel] Balance: avg={avg:.1f} batches/GPU, max_imbalance={max_imbalance:.1f}")
+
     else:
-        # Fewer or equal dimensions than GPUs: Use greedy balancing
         logger.info(f"[bucketed_parallel] {num_dimensions} dimensions <= {world_size} GPUs")
-        logger.info(f"[bucketed_parallel] Using greedy algorithm to balance batches")
-        
-        # Initialize batch count per GPU
-        gpu_batches = [0] * world_size
-        gpu_assignments = [[] for _ in range(world_size)]
-        
-        # Sort dimensions by number of batches (descending) for better balance
-        sorted_dims = sorted(dim_info.items(), key=lambda x: -x[1]['num_batches'])
-        
-        # Greedy assignment: assign each dimension to GPU with fewest batches
-        for dim_str, info in sorted_dims:
-            # Find GPU with minimum batches
-            min_gpu = min(range(world_size), key=lambda i: gpu_batches[i])
-            
-            # Assign this dimension to that GPU
-            gpu_assignments[min_gpu].append(dim_str)
-            gpu_batches[min_gpu] += info['num_batches']
-        
-        # Create size_list (one entry per GPU, may have empty GPUs)
-        size_list = []
-        for gpu_id, gpu_dims in enumerate(gpu_assignments):
-            if gpu_dims:
-                # Use the first (largest) dimension assigned to this GPU
-                size_list.append(gpu_dims[0])
-            else:
-                # Empty GPU: assign smallest dimension as fallback
-                size_list.append(min(dim_info.keys(), key=lambda x: dim_info[x]['size_product']))
-        
-        # Log distribution
-        logger.info(f"[bucketed_parallel] GPU dimension assignment (balanced by batches):")
-        for gpu_id in range(world_size):
-            if gpu_id < len(gpu_assignments):
-                dims = gpu_assignments[gpu_id]
-                batches = gpu_batches[gpu_id]
-                logger.info(f"  GPU {gpu_id}: {dims} ({batches} batches)")
-        
-        total_batches = sum(gpu_batches)
-        avg_batches = total_batches / world_size if world_size > 0 else 0
-        max_imbalance = max(abs(b - avg_batches) for b in gpu_batches)
-        logger.info(f"[bucketed_parallel] Balance: avg={avg_batches:.1f} batches/GPU, max_imbalance={max_imbalance:.1f}")
-    
-    logger.info(f"[bucketed_parallel] Total unique dimensions: {len(dim_info)}, GPUs: {world_size}, "
-               f"size_list length: {len(size_list)}")
-    
+        logger.info(f"[bucketed_parallel] Proportionally allocating GPUs based on batch count")
+
+        # Reconstruct gpu_counts from size_list for logging
+        gpu_counts: dict[str, int] = {}
+        for d in size_list:
+            gpu_counts[d] = gpu_counts.get(d, 0) + 1
+
+        logger.info(f"[bucketed_parallel] GPU allocation per dimension:")
+        for dim_str in sorted(gpu_counts.keys(), key=lambda x: dim_info[x]['size_product']):
+            n = gpu_counts[dim_str]
+            nb = dim_info[dim_str]['num_batches']
+            logger.info(
+                f"  {dim_str}: {n} GPUs, {nb} total batches, ~{nb / n:.1f} batches/GPU"
+            )
+
+        all_loads = [dim_info[d]['num_batches'] / gpu_counts[d] for d in gpu_counts]
+        logger.info(
+            f"[bucketed_parallel] Balance: max={max(all_loads):.1f}, "
+            f"min={min(all_loads):.1f} batches/GPU"
+        )
+
+    # Per-GPU assignment table
+    gpu_counts_log: dict[str, int] = {}
+    for d in size_list:
+        gpu_counts_log[d] = gpu_counts_log.get(d, 0) + 1
+
+    logger.info(f"[bucketed_parallel] Per-GPU assignment (sorted by rank):")
+    for gpu_id, dim_str in enumerate(size_list):
+        n_gpus_for_dim = gpu_counts_log[dim_str]
+        nb_total = dim_info[dim_str]['num_batches']
+        nb_per_gpu = math.ceil(nb_total / n_gpus_for_dim)
+        bs = dim_info[dim_str]['batch_size']
+        logger.info(
+            f"  GPU {gpu_id:>3}: {dim_str}, batch_size={bs}, ~{nb_per_gpu} batches"
+        )
+
+    logger.info(
+        f"[bucketed_parallel] Total unique dimensions: {len(dim_info)}, "
+        f"GPUs: {world_size}, size_list length: {len(size_list)}"
+    )
     return size_list
+
+
+def _compute_max_iter_from_size_list(dim_info: dict, size_list: list) -> int:
+    """
+    Compute MAX_ITER as the minimum number of batches-per-GPU across all GPU assignments.
+
+    For each unique dimension in size_list, the per-GPU batch count is:
+        ceil(total_batches_for_dim / num_gpus_assigned_to_dim)
+
+    MAX_ITER is the minimum of these values across all dimensions, ensuring every
+    GPU completes at least that many iterations before the epoch ends.
+
+    Args:
+        dim_info (dict): {dim_str: {'num_batches': int, ...}}
+        size_list (list): One entry per GPU (length == world_size).
+
+    Returns:
+        int: Dynamic MAX_ITER (>= 1).
+    """
+    gpu_counts: dict[str, int] = {}
+    for d in size_list:
+        gpu_counts[d] = gpu_counts.get(d, 0) + 1
+
+    min_batches = min(
+        math.ceil(dim_info[d]['num_batches'] / gpu_counts[d])
+        for d in gpu_counts
+    )
+    return max(min_batches, 1)
 
 
 def partition_data_by_size(
@@ -257,14 +322,14 @@ def partition_data_by_size(
         base_batch_size (int): Base batch size (for reference size 256x256x128).
     
     Returns:
-        tuple: (train_files_for_rank, batch_size_for_rank, dimensions_assigned)
+        tuple: (train_files_for_rank, batch_size_for_rank, dimensions_assigned, max_iter)
     """
     # Analyze data distribution (only rank 0 logs details)
     if global_rank == 0:
         dim_info = analyze_data_distribution(all_train_files, base_batch_size, logger)
         size_list = distribute_dimensions_across_gpus(dim_info, world_size, logger)
     else:
-        # Other ranks need to compute the same distribution
+        # Other ranks compute the same dim_info, then call _compute_size_list for consistency
         dim_counts = defaultdict(int)
         for f in all_train_files:
             dim = f.get('dim')
@@ -275,43 +340,31 @@ def partition_data_by_size(
                 )
             dim_str = 'x'.join(map(str, dim))
             dim_counts[dim_str] += 1
-        
+
         dim_info = {}
         for dim_str, count in dim_counts.items():
             dimensions = list(map(int, dim_str.split('x')))
             size_product = dimensions[0] * dimensions[1] * dimensions[2]
-            batch_size = max(1, min(32, int(base_batch_size * REFERENCE_SIZE_PRODUCT / size_product)))
+            batch_size = max(1, min(96, int(base_batch_size * REFERENCE_SIZE_PRODUCT / size_product)))
             num_batches = math.ceil(float(count) / batch_size)
-            dim_info[dim_str] = {'count': count, 'batch_size': batch_size, 'num_batches': num_batches, 'size_product': size_product}
-        
-        num_dimensions = len(dim_info)
-        
-        if num_dimensions > world_size:
-            # More dimensions than GPUs: Pick top dimensions by num_batches
-            sorted_by_batches = sorted(dim_info.items(), key=lambda x: -x[1]['num_batches'])
-            size_list = [dim_str for dim_str, _ in sorted_by_batches[:world_size]]
-        else:
-            # Fewer or equal dimensions: Greedy balancing
-            gpu_batches = [0] * world_size
-            gpu_assignments = [[] for _ in range(world_size)]
-            sorted_dims = sorted(dim_info.items(), key=lambda x: -x[1]['num_batches'])
-            for dim_str, info in sorted_dims:
-                min_gpu = min(range(world_size), key=lambda i: gpu_batches[i])
-                gpu_assignments[min_gpu].append(dim_str)
-                gpu_batches[min_gpu] += info['num_batches']
-            
-            size_list = []
-            for gpu_id, gpu_dims in enumerate(gpu_assignments):
-                if gpu_dims:
-                    size_list.append(gpu_dims[0])
-                else:
-                    size_list.append(min(dim_info.keys(), key=lambda x: dim_info[x]['size_product']))
-    
+            dim_info[dim_str] = {
+                'count': count,
+                'batch_size': batch_size,
+                'num_batches': num_batches,
+                'size_product': size_product,
+            }
+
+        # Use the same pure allocation logic as rank 0 (no logging)
+        size_list = _compute_size_list(dim_info, world_size)
+
     size_list.sort()
-    
-    if global_rank == 0:
-        logger.info(f"[bucketed_parallel] Size distribution across {world_size} GPUs: {set(size_list)}")
-        logger.info(f"[bucketed_parallel] Size counts: {dict((s, size_list.count(s)) for s in set(size_list))}")
+
+    # Dynamic MAX_ITER: min batches-per-GPU across all dimension assignments
+    max_iter = _compute_max_iter_from_size_list(dim_info, size_list)
+    logger.info(f"[bucketed_parallel] Dynamic MAX_ITER = {max_iter} "
+                f"(min batches/GPU across all assigned dimensions)")
+    logger.info(f"[bucketed_parallel] Size distribution across {world_size} GPUs: {set(size_list)}")
+    logger.info(f"[bucketed_parallel] Size counts: {dict((s, size_list.count(s)) for s in set(size_list))}")
     
     size_rank = global_rank % len(size_list)
     list_builtin = builtins.list
@@ -338,18 +391,18 @@ def partition_data_by_size(
     
     batch_size = int(base_batch_size * REFERENCE_SIZE_PRODUCT / size_product)
     batch_size = max(batch_size, 1)
-    batch_size = min(batch_size, 32)
+    batch_size = min(batch_size, 96)
     
     logger.info(f"[bucketed_parallel] Rank {global_rank}: calculated batch_size={batch_size} for size {size_str}")
     
     num_batch = float(len(train_files_filtered)) / batch_size
-    if math.ceil(num_batch) < MAX_ITER:
-        replication_factor = math.ceil(float(MAX_ITER) / num_batch)
+    if math.ceil(num_batch) < max_iter:
+        replication_factor = math.ceil(float(max_iter) / num_batch)
         train_files_filtered = train_files_filtered * replication_factor
         logger.info(f"[bucketed_parallel] Rank {global_rank}: replicated data {replication_factor}x "
-                   f"to ensure {MAX_ITER} iterations ({len(train_files_filtered)} total files)")
-    
-    return train_files_filtered, batch_size, dimensions
+                   f"to ensure {max_iter} iterations ({len(train_files_filtered)} total files)")
+
+    return train_files_filtered, batch_size, dimensions, max_iter
 
 
 def diff_model_train(
@@ -357,143 +410,76 @@ def diff_model_train(
 ) -> None:
     """Main training function with by-size bucketing support."""
     args = load_config(env_config_path, model_config_path, model_def_path)
-    local_rank, world_size, device = initialize_distributed()
+    local_rank, global_rank, world_size, device = initialize_distributed()
     logger = setup_logging("training")
 
     logger.info(f"Using {device} of {world_size}")
-    
-    # Check autoencoder file early if validation is enabled (only check once at startup)
-    args.validation_enabled = False
-    
-    if local_rank == 0:
-        autoencoder_path = getattr(args, 'trained_autoencoder_path', None)
-        if not autoencoder_path:
-            logger.warning("=" * 80)
-            logger.warning("⚠️  VALIDATION IMAGE GENERATION DISABLED ⚠️")
-            logger.warning("=" * 80)
-            logger.warning("Reason: Autoencoder path not configured in config file")
-            logger.warning("Validation image generation requires the autoencoder model.")
-            logger.warning("Please set 'trained_autoencoder_path' in your config.")
-            logger.warning("Validation will be skipped for all epochs.")
-            logger.warning("=" * 80)
-            args.validation_enabled = False
-        elif not os.path.exists(autoencoder_path):
-            logger.warning("=" * 80)
-            logger.warning("⚠️  VALIDATION IMAGE GENERATION DISABLED ⚠️")
-            logger.warning("=" * 80)
-            logger.warning(f"Reason: Autoencoder file not found: {autoencoder_path}")
-            logger.warning("Validation image generation requires the autoencoder model.")
-            logger.warning("Please ensure the autoencoder checkpoint exists before running validation.")
-            logger.warning("Validation will be skipped for all epochs.")
-            logger.warning("=" * 80)
-            args.validation_enabled = False
-        else:
-            # Autoencoder file exists - validation enabled
-            args.validation_enabled = True
-            logger.info(f"Autoencoder file found: {autoencoder_path} (validation will run every {VAL_INTERVAL} epochs)")
-    
-    # Broadcast validation_enabled to all ranks in distributed training
-    if dist.is_initialized():
-        validation_enabled_tensor = torch.tensor([1 if args.validation_enabled else 0], dtype=torch.int, device=device)
-        dist.broadcast(validation_enabled_tensor, src=0)
-        args.validation_enabled = bool(validation_enabled_tensor.item())
-    
+
+    # Check autoencoder availability and broadcast validation_enabled to all ranks
+    setup_validation(args, device, global_rank, logger)
+
+    # TensorBoard: only the global rank-0 process writes events
     tensorboard_writer = None
-    if local_rank == 0:
+    if global_rank == 0:
         tensorboard_path = args.tfevent_dir
         Path(tensorboard_path).mkdir(parents=True, exist_ok=True)
         tensorboard_writer = SummaryWriter(tensorboard_path)
         logger.info(f"TensorBoard logging to: {tensorboard_path}")
-    
-    # This script always uses by_size bucketing (partition_type is implicit)
+
+    # Bucketed-parallel specifics
     logger.info(f"[bucketed_parallel] Using by_size bucketing (script choice determines partition type)")
-    logger.info(f"[bucketed_parallel] MAX_ITER set to {MAX_ITER} iterations per epoch")
-    
+    logger.info(f"[bucketed_parallel] MAX_ITER will be set dynamically to min(batches/GPU) across all dimensions")
+    # image_dim accepts None, a single dim [x,y,z], or a list of dims [[x,y,z],[x2,y2,z2]]
     image_dim = args.diffusion_unet_train.get('image_dim', None)
     if image_dim is not None:
-        logger.warning(f"[bucketed_parallel] image_dim filter ({image_dim}) is ignored - all dimensions loaded for bucketing")
+        logger.info(f"[bucketed_parallel] image_dim filter active: {image_dim}")
+    else:
+        logger.info(f"[bucketed_parallel] image_dim filter: None (all dimensions loaded)")
 
-    if local_rank == 0:
-        logger.info(f"[config] ckpt_folder -> {args.model_dir}.")
-        logger.info(f"[config] data_root -> {args.embedding_base_dir}.")
-        logger.info(f"[config] data_list -> {args.json_data_list}.")
-        logger.info(f"[config] lr -> {args.diffusion_unet_train['lr']}.")
-        logger.info(f"[config] num_epochs -> {args.diffusion_unet_train['n_epochs']}.")
-        logger.info(f"[config] num_train_timesteps -> {args.noise_scheduler['num_train_timesteps']}.")
-
+    # Config summary + checkpoint dir (rank-0 only for filesystem ops)
+    logger.info(f"[config] ckpt_folder -> {args.model_dir}.")
+    logger.info(f"[config] data_root -> {args.embedding_base_dir}.")
+    logger.info(f"[config] data_list -> {args.json_data_list}.")
+    logger.info(f"[config] lr -> {args.diffusion_unet_train['lr']}.")
+    logger.info(f"[config] num_epochs -> {args.diffusion_unet_train['n_epochs']}.")
+    logger.info(f"[config] num_train_timesteps -> {args.noise_scheduler['num_train_timesteps']}.")
+    if global_rank == 0:
         Path(args.model_dir).mkdir(parents=True, exist_ok=True)
 
     unet, scale_factor, start_epoch, optimizer_state_dict, scheduler_state_dict = load_unet(args, device, logger)
     noise_scheduler = define_instance(args, "noise_scheduler")
-    
+
     model_for_attr = unet.module if isinstance(unet, DistributedDataParallel) else unet
     include_body_region = model_for_attr.include_top_region_index_input
     include_modality = (model_for_attr.num_class_embeds is not None)
-    
+
     if include_modality:
         with open(args.modality_mapping_path, "r") as f:
             args.modality_mapping = json.load(f)
     else:
         args.modality_mapping = None
 
-    train_files = load_filenames(
-        args.json_data_list,
-        args.embedding_base_dir,
-        image_dim=None  # Load all dimensions for by_size bucketing
-    )
-    if local_rank == 0:
-        logger.info(f"num_files_train (all): {len(train_files)}")
+    # Load files — image_dim filter applied inside load_filenames (supports single or multi-dim)
+    train_files = load_filenames(args.json_data_list, args.embedding_base_dir, image_dim=image_dim)
+    logger.info(f"num_files_train: {len(train_files)}")
 
-    valid_train_files = []
-    for file_entry in train_files:
-        if not os.path.exists(file_entry['image']):
-            if local_rank == 0:
-                logger.warning(f"File not found, skipping: {file_entry['image']}")
-            continue
-        valid_train_files.append(file_entry)
-    
-    if local_rank == 0:
-        logger.info(f"Valid training files: {len(valid_train_files)}")
-    
-    modality_counts = {}
-    for file_entry in valid_train_files:
-        modality = file_entry['modality']
-        modality_counts[modality] = modality_counts.get(modality, 0) + 1
-    
-    total_files = len(valid_train_files)
-    max_weight = 100.0
-    modality_weights = {}
-    for mod, count in modality_counts.items():
-        weight = total_files / count
-        modality_weights[mod] = min(weight, max_weight)
-    
-    for file_entry in valid_train_files:
-        file_entry['sample_weight'] = modality_weights[file_entry['modality']]
-    
-    if local_rank == 0:
-        logger.info(f"Modality distribution (max_weight={max_weight}):")
-        for mod, count in sorted(modality_counts.items(), key=lambda x: -x[1]):
-            raw_weight = total_files / count
-            capped_weight = modality_weights[mod]
-            if raw_weight > max_weight:
-                logger.info(f"  {mod}: {count} files (weight: {capped_weight:.4f}, capped from {raw_weight:.4f})")
-            else:
-                logger.info(f"  {mod}: {count} files (weight: {capped_weight:.4f})")
-    
-    # By-size bucketing: partition data by image dimensions
-    partitioned_train_files, batch_size, assigned_dims = partition_data_by_size(
+    # Filter missing files, then compute modality-based sampling weights
+    valid_train_files = filter_existing_files(train_files, logger)
+    compute_modality_weights(valid_train_files, max_weight=10.0, logger=logger)
+
+    # By-size bucketing: partition data by image dimensions across GPUs
+    partitioned_train_files, batch_size, assigned_dims, max_iter = partition_data_by_size(
         all_train_files=valid_train_files,
-        global_rank=dist.get_rank() if dist.is_initialized() else 0,
+        global_rank=global_rank,
         world_size=world_size,
         logger=logger,
         base_batch_size=args.diffusion_unet_train["batch_size"],
     )
-    logger.info(f"[bucketed_parallel] Rank {local_rank}: {len(partitioned_train_files)} files, "
-               f"batch_size={batch_size}, dims={assigned_dims}")
+    logger.info(f"[bucketed_parallel] Rank {global_rank}: {len(partitioned_train_files)} files, "
+                f"batch_size={batch_size}, dims={assigned_dims}, max_iter={max_iter}")
 
     use_weighted_sampling = args.diffusion_unet_train.get("use_weighted_sampling", True)
-    if local_rank == 0:
-        logger.info(f"Weighted sampling: {'enabled' if use_weighted_sampling else 'disabled'}")
+    logger.info(f"Weighted sampling: {'enabled' if use_weighted_sampling else 'disabled'}")
 
     train_loader, sampler = prepare_data(
         partitioned_train_files,
@@ -502,27 +488,31 @@ def diff_model_train(
         batch_size=batch_size,
         include_body_region=include_body_region,
         include_modality=include_modality,
-        modality_mapping = args.modality_mapping,
-        use_weighted_sampling=use_weighted_sampling
+        modality_mapping=args.modality_mapping,
+        use_weighted_sampling=use_weighted_sampling,
     )
 
     if scale_factor is None:
         scale_factor = calculate_scale_factor(train_loader, device, logger)
     else:
         logger.info(f"Using loaded scale_factor: {scale_factor}.")
-    
+
     optimizer = create_optimizer(unet, args.diffusion_unet_train["lr"])
-    if optimizer_state_dict is not None:
+    if start_epoch > 0 and optimizer_state_dict is not None:
         optimizer.load_state_dict(optimizer_state_dict)
         logger.info("Loaded optimizer state from checkpoint.")
+    elif optimizer_state_dict is not None:
+        logger.warning("Skipping optimizer state loading.")
 
-    # Calculate total steps for by_size bucketing
-    total_steps = (args.diffusion_unet_train["n_epochs"] - start_epoch) * MAX_ITER
+    # Total steps for by_size bucketing: one step per epoch (scheduler steps per epoch)
+    total_steps = args.diffusion_unet_train["n_epochs"] - start_epoch
     lr_scheduler = create_lr_scheduler(optimizer, total_steps)
-    if scheduler_state_dict is not None:
+    if start_epoch > 0 and scheduler_state_dict is not None:
         lr_scheduler.load_state_dict(scheduler_state_dict)
         logger.info("Loaded scheduler state from checkpoint.")
-    
+    elif scheduler_state_dict is not None:
+        logger.warning("Skipping lr_scheduler state loading.")
+
     loss_pt = torch.nn.L1Loss()
     scaler = GradScaler("cuda")
 
@@ -544,16 +534,17 @@ def diff_model_train(
             args.noise_scheduler["num_train_timesteps"],
             device,
             logger,
-            local_rank,
+            global_rank,
             amp=amp,
-            max_iter=MAX_ITER,  # Always use MAX_ITER for by_size bucketing
+            max_iter=max_iter,  # Dynamic: min batches/GPU across all assigned dimensions
         )
+        lr_scheduler.step()  # Step LR once per epoch
 
         loss_torch = loss_torch.tolist()
-        if torch.cuda.device_count() == 1 or local_rank == 0:
+        if torch.cuda.device_count() == 1 or global_rank == 0:
             loss_torch_epoch = loss_torch[0] / loss_torch[1]
             logger.info(f"epoch {epoch + 1} average loss: {loss_torch_epoch:.4f}.")
-            
+
             if tensorboard_writer is not None:
                 tensorboard_writer.add_scalar('train/loss', loss_torch_epoch, epoch + 1)
 
@@ -569,13 +560,12 @@ def diff_model_train(
                 scheduler=lr_scheduler,
                 epoch_finished=True,
             )
-            
+
             if (epoch + 1) % SAVE_EPOCH_INTERVAL == 0:
                 if args.model_filename.endswith('.safetensors'):
                     epoch_filename = args.model_filename.replace('.safetensors', f'_epoch{epoch + 1}.safetensors')
                 else:
                     epoch_filename = args.model_filename.replace('.pt', f'_epoch{epoch + 1}.pt')
-                
                 save_checkpoint(
                     epoch,
                     unet,
@@ -589,19 +579,19 @@ def diff_model_train(
                     epoch_finished=True,
                 )
                 logger.info(f"Saved periodic checkpoint: {epoch_filename}")
-            
-            # Generate and log validation images every VAL_INTERVAL epochs (only if validation is enabled)
+
             if args.validation_enabled and (epoch + 1) % VAL_INTERVAL == 0:
                 logger.info(f"Generating validation images at epoch {epoch + 1}...")
-                
                 generated_images = generate_validation_images_for_modalities(
                     env_config_path,
                     model_config_path,
                     model_def_path,
                     args,
                     logger,
+                    unet,
+                    scale_factor,
+                    device,
                 )
-                
                 if generated_images and tensorboard_writer is not None:
                     log_validation_images_to_tensorboard(
                         generated_images,
@@ -609,7 +599,7 @@ def diff_model_train(
                         tensorboard_writer,
                         logger,
                     )
-    
+
     if tensorboard_writer is not None:
         tensorboard_writer.close()
         logger.info("TensorBoard writer closed.")

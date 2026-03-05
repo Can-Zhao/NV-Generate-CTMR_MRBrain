@@ -14,6 +14,8 @@ import json
 import logging
 import math
 import os
+import shutil
+import tempfile
 from argparse import Namespace
 from datetime import timedelta
 from typing import Any, Sequence
@@ -928,6 +930,100 @@ def load_checkpoint_safetensors(
     return unet, scale_factor, start_epoch, optimizer_state_dict, scheduler_state_dict
 
 
+def load_unet(args: Namespace, device: torch.device, logger: logging.Logger) -> tuple:
+    """
+    Load the UNet model and all training states for resumption (convenience wrapper).
+    
+    This function creates a UNet model from args configuration and loads a checkpoint
+    if available. If the checkpoint fails to load (e.g., corrupted), it automatically
+    searches for the most recent periodic checkpoint and loads that instead.
+
+    Args:
+        args (Namespace): Configuration arguments containing:
+            - diffusion_unet_def: Model architecture definition
+            - existing_ckpt_filepath: Path to checkpoint file (optional)
+        device (torch.device): Device to load the model on.
+        logger (logging.Logger): Logger for logging information.
+
+    Returns:
+        tuple: (unet, scale_factor, start_epoch, optimizer_state_dict, scheduler_state_dict)
+    """
+    import glob
+    import re
+    from torch.nn.parallel import DistributedDataParallel
+    
+    # Create model from args
+    unet = define_instance(args, "diffusion_unet_def").to(device)
+    unet = torch.nn.SyncBatchNorm.convert_sync_batchnorm(unet)
+
+    # Wrap in DDP if distributed
+    if dist.is_initialized():
+        unet = DistributedDataParallel(unet, device_ids=[device], find_unused_parameters=True)
+
+    # Get checkpoint path
+    checkpoint_path = getattr(args, 'existing_ckpt_filepath', None)
+    
+    # Try loading the specified checkpoint
+    try:
+        return load_checkpoint(checkpoint_path, unet, device, logger, strict=False)
+    except Exception as e:
+        logger.warning(f"Failed to load checkpoint from {checkpoint_path}: {str(e)}")
+        
+        # Try to find periodic checkpoints as fallback
+        if checkpoint_path and os.path.exists(os.path.dirname(checkpoint_path)):
+            ckpt_dir = os.path.dirname(checkpoint_path)
+            base_filename = os.path.basename(checkpoint_path)
+            
+            # Create pattern for periodic checkpoints
+            # e.g., "model.pt" -> "model_epoch*.pt" or "model.safetensors" -> "model_epoch*.safetensors"
+            if base_filename.endswith('.safetensors'):
+                pattern_filename = base_filename.replace('.safetensors', '_epoch*.safetensors')
+            elif base_filename.endswith('.pt'):
+                pattern_filename = base_filename.replace('.pt', '_epoch*.pt')
+            else:
+                pattern_filename = base_filename + '_epoch*.pt'
+            pattern_path = os.path.join(ckpt_dir, pattern_filename)
+            
+            # Find all matching periodic checkpoints
+            periodic_ckpts = glob.glob(pattern_path)
+            
+            if periodic_ckpts:
+                # Extract epoch numbers and find the latest one
+                epoch_ckpts = []
+                for ckpt_path in periodic_ckpts:
+                    # Match both .pt and .safetensors patterns
+                    match = re.search(r'_epoch(\d+)\.(pt|safetensors)$', ckpt_path)
+                    if match:
+                        epoch_num = int(match.group(1))
+                        epoch_ckpts.append((epoch_num, ckpt_path))
+                
+                if epoch_ckpts:
+                    # Sort by epoch number and get the latest
+                    epoch_ckpts.sort(reverse=True)
+                    latest_epoch, fallback_ckpt = epoch_ckpts[0]
+                    
+                    logger.info(f"Found {len(epoch_ckpts)} periodic checkpoint(s)")
+                    logger.info(f"Attempting to load fallback checkpoint: {fallback_ckpt}")
+                    
+                    try:
+                        return load_checkpoint(fallback_ckpt, unet, device, logger, strict=False)
+                    except Exception as fallback_e:
+                        logger.error(f"Fallback checkpoint also failed to load: {str(fallback_e)}")
+                        logger.info("Starting training from scratch.")
+                        return unet, None, 0, None, None
+                else:
+                    logger.warning("No valid periodic checkpoints found with epoch numbers.")
+                    logger.info("Starting training from scratch.")
+                    return unet, None, 0, None, None
+            else:
+                logger.warning(f"No periodic checkpoints found matching pattern: {pattern_path}")
+                logger.info("Starting training from scratch.")
+                return unet, None, 0, None, None
+        else:
+            logger.info("Starting training from scratch.")
+            return unet, None, 0, None, None
+
+
 def save_checkpoint(
     epoch: int,
     unet: torch.nn.Module,
@@ -1026,7 +1122,21 @@ def save_checkpoint_pytorch(
     if scheduler is not None:
         to_save_dict["scheduler_state_dict"] = scheduler.state_dict()
     
-    torch.save(to_save_dict, f"{ckpt_folder}/{model_filename}")
+    # Atomic write: save to temporary file first, then rename to final destination
+    # This prevents corruption if the process is interrupted during writing
+    final_path = f"{ckpt_folder}/{model_filename}"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='wb', dir=ckpt_folder, delete=False) as tmp_file:
+            tmp_path = tmp_file.name
+            torch.save(to_save_dict, tmp_path)
+        # Atomic rename (works on same filesystem)
+        shutil.move(tmp_path, final_path)
+    except Exception as e:
+        # Clean up temp file if it exists
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
 
 def save_checkpoint_safetensors(
@@ -1079,9 +1189,20 @@ def save_checkpoint_safetensors(
         safetensors_filename = model_filename + '.safetensors'
         training_state_filename = model_filename + '_training_state.pt'
     
-    # 1. Save model weights in SafeTensors format (simple!)
+    # 1. Save model weights in SafeTensors format (atomic write)
     safetensors_path = f"{ckpt_folder}/{safetensors_filename}"
-    save_file(unet_state_dict, safetensors_path)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='wb', dir=ckpt_folder, delete=False, suffix='.safetensors') as tmp_file:
+            tmp_path = tmp_file.name
+            save_file(unet_state_dict, tmp_path)
+        # Atomic rename (works on same filesystem)
+        shutil.move(tmp_path, safetensors_path)
+    except Exception as e:
+        # Clean up temp file if it exists
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
     
     # 2. Save training state in PyTorch format (simple!)
     training_state = {
@@ -1103,4 +1224,17 @@ def save_checkpoint_safetensors(
         training_state["scheduler_state_dict"] = scheduler.state_dict()
     
     training_state_path = f"{ckpt_folder}/{training_state_filename}"
-    torch.save(training_state, training_state_path)
+    # Atomic write: save to temporary file first, then rename to final destination
+    # This prevents corruption if the process is interrupted during writing
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='wb', dir=ckpt_folder, delete=False, suffix='.pt') as tmp_file:
+            tmp_path = tmp_file.name
+            torch.save(training_state, tmp_path)
+        # Atomic rename (works on same filesystem)
+        shutil.move(tmp_path, training_state_path)
+    except Exception as e:
+        # Clean up temp file if it exists
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise

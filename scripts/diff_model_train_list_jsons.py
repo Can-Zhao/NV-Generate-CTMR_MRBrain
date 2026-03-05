@@ -63,8 +63,10 @@ import argparse
 import json
 import logging
 import os
+import sys
 from datetime import datetime
 from pathlib import Path
+import yaml
 
 import monai
 import torch
@@ -79,15 +81,15 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.tensorboard import SummaryWriter
 
 from .diff_model_setting import initialize_distributed, load_config, setup_logging
-from .utils import define_instance, load_checkpoint, save_checkpoint
-# Import diff_model_infer for validation image generation
-from .diff_model_infer import diff_model_infer
+from .utils import define_instance, load_checkpoint, load_unet, save_checkpoint
+# Import inference functions directly (avoid distributed setup/teardown)
+from .diff_model_infer import load_models, prepare_tensors, run_inference
 
 # Checkpoint saving interval (save every N epochs)
-SAVE_EPOCH_INTERVAL = 200
+SAVE_EPOCH_INTERVAL = 500
 
 # Validation image generation interval (generate every N epochs)
-VAL_INTERVAL = 50
+VAL_INTERVAL = 250
 
 def augment_modality_label(modality_tensor, prob=0.1):
     """
@@ -122,93 +124,6 @@ def augment_modality_label(modality_tensor, prob=0.1):
     return modality_tensor
 
 
-def load_unet(args: argparse.Namespace, device: torch.device, logger: logging.Logger) -> tuple:
-    """
-    Load the UNet model and all training states for resumption (convenience wrapper).
-    
-    This function creates a UNet model from args configuration and loads a checkpoint
-    if available. If the checkpoint fails to load (e.g., corrupted), it automatically
-    searches for the most recent periodic checkpoint and loads that instead.
-
-    Args:
-        args (argparse.Namespace): Configuration arguments containing:
-            - diffusion_unet_def: Model architecture definition
-            - existing_ckpt_filepath: Path to checkpoint file (optional)
-        device (torch.device): Device to load the model on.
-        logger (logging.Logger): Logger for logging information.
-
-    Returns:
-        tuple: (unet, scale_factor, start_epoch, optimizer_state_dict, scheduler_state_dict)
-    """
-    import glob
-    import re
-    
-    # Create model from args
-    unet = define_instance(args, "diffusion_unet_def").to(device)
-    unet = torch.nn.SyncBatchNorm.convert_sync_batchnorm(unet)
-
-    # Wrap in DDP if distributed
-    if dist.is_initialized():
-        unet = DistributedDataParallel(unet, device_ids=[device], find_unused_parameters=True)
-
-    # Get checkpoint path
-    checkpoint_path = getattr(args, 'existing_ckpt_filepath', None)
-    
-    # Try loading the specified checkpoint
-    try:
-        return load_checkpoint(checkpoint_path, unet, device, logger, strict=False)
-    except Exception as e:
-        logger.warning(f"Failed to load checkpoint from {checkpoint_path}: {str(e)}")
-        
-        # Try to find periodic checkpoints as fallback
-        if checkpoint_path and os.path.exists(os.path.dirname(checkpoint_path)):
-            ckpt_dir = os.path.dirname(checkpoint_path)
-            base_filename = os.path.basename(checkpoint_path)
-            
-            # Create pattern for periodic checkpoints
-            # e.g., "model.pt" -> "model_epoch*.pt"
-            pattern_filename = base_filename.replace('.pt', '_epoch*.pt')
-            pattern_path = os.path.join(ckpt_dir, pattern_filename)
-            
-            # Find all matching periodic checkpoints
-            periodic_ckpts = glob.glob(pattern_path)
-            
-            if periodic_ckpts:
-                # Extract epoch numbers and find the latest one
-                epoch_ckpts = []
-                for ckpt_path in periodic_ckpts:
-                    match = re.search(r'_epoch(\d+)\.pt$', ckpt_path)
-                    if match:
-                        epoch_num = int(match.group(1))
-                        epoch_ckpts.append((epoch_num, ckpt_path))
-                
-                if epoch_ckpts:
-                    # Sort by epoch number and get the latest
-                    epoch_ckpts.sort(reverse=True)
-                    latest_epoch, fallback_ckpt = epoch_ckpts[0]
-                    
-                    logger.info(f"Found {len(epoch_ckpts)} periodic checkpoint(s)")
-                    logger.info(f"Attempting to load fallback checkpoint: {fallback_ckpt}")
-                    
-                    try:
-                        return load_checkpoint(fallback_ckpt, unet, device, logger, strict=False)
-                    except Exception as fallback_e:
-                        logger.error(f"Fallback checkpoint also failed to load: {str(fallback_e)}")
-                        logger.info("Starting training from scratch.")
-                        return unet, None, 0, None, None
-                else:
-                    logger.warning("No valid periodic checkpoints found with epoch numbers.")
-                    logger.info("Starting training from scratch.")
-                    return unet, None, 0, None, None
-            else:
-                logger.warning(f"No periodic checkpoints found matching pattern: {pattern_path}")
-                logger.info("Starting training from scratch.")
-                return unet, None, 0, None, None
-        else:
-            logger.info("Starting training from scratch.")
-            return unet, None, 0, None, None
-
-
 def load_filenames(json_data_list, embedding_base_dir, image_dim=None):
     """
     Load filenames and metadata from JSON data list(s) and embedding directory(ies).
@@ -218,18 +133,28 @@ def load_filenames(json_data_list, embedding_base_dir, image_dim=None):
     Args:
         json_data_list (str or list): Path(s) to JSON data list file(s).
         embedding_base_dir (str or list): Base directory(ies) for embeddings.
-        image_dim (list or None): If provided, filter to only include embeddings with this
-                                   dimension [x, y, z]. If None, include all dimensions.
+        image_dim (list or None): Dimension filter. Accepts:
+            - None: include all dimensions.
+            - [x, y, z]: include only this single dimension.
+            - [[x,y,z], [x2,y2,z2], ...]: include any of these dimensions.
 
     Returns:
         list: List of dicts with keys: 'image' (full path), 'spacing', 'modality', 'dim'.
     """
+    # Normalize image_dim to a list-of-dims (or None for "all")
+    if image_dim is None:
+        allowed_dims = None
+    elif isinstance(image_dim[0], int):    # single dim: [128, 128, 128]
+        allowed_dims = [image_dim]
+    else:                                  # list of dims: [[128,128,128], [256,256,128]]
+        allowed_dims = [list(d) for d in image_dim]
+
     # Normalize to lists
     if isinstance(json_data_list, str):
         json_data_list = [json_data_list]
     if isinstance(embedding_base_dir, str):
         embedding_base_dir = [embedding_base_dir]
-    
+
     # Ensure matching lengths
     if len(json_data_list) != len(embedding_base_dir):
         if len(embedding_base_dir) == 1:
@@ -239,29 +164,35 @@ def load_filenames(json_data_list, embedding_base_dir, image_dim=None):
             raise ValueError(
                 f"Mismatch: {len(json_data_list)} JSON files but {len(embedding_base_dir)} embedding directories"
             )
-    
+
     all_files = []
     for json_path, base_dir in zip(json_data_list, embedding_base_dir):
         with open(json_path, "r") as file:
             json_data = json.load(file)
-        
+
         filenames_train = json_data["training"]
         for _item in filenames_train:
             # Filter by image dimension if specified
-            if image_dim is not None:
+            if allowed_dims is not None:
                 item_dim = _item.get('dim', None)
-                if item_dim is None or item_dim != image_dim:
+                if item_dim is None or item_dim not in allowed_dims:
                     continue
             
             embedding_filename = _item["image"]  # Already includes _emb.nii.gz
             full_path = os.path.join(base_dir, embedding_filename)
             
-            # Create file entry with metadata
+            # Create file entry with metadata — 'dim' and 'spacing' are required
+            for required_field in ('dim', 'spacing'):
+                if required_field not in _item:
+                    raise ValueError(
+                        f"JSON entry is missing required '{required_field}' field: "
+                        f"{_item.get('image', '<unknown>')} (in {json_path})"
+                    )
             file_entry = {
                 'image': full_path,
-                'spacing': _item.get('spacing', [1.0, 1.0, 1.0]),
-                'modality': _item.get('class', 'mri'),  # 'class' field contains modality
-                'dim': _item.get('dim', [128, 128, 128]),  # Include dim for optional use
+                'spacing': _item['spacing'],
+                'modality': _item.get('class', 'unknown'),  # 'class' field contains modality
+                'dim': _item['dim'],
             }
             
             # Include body region indices if available (for anatomical conditioning)
@@ -371,13 +302,121 @@ def calculate_scale_factor(train_loader: DataLoader, device: torch.device, logge
     check_data = first(train_loader)
     z = check_data["image"].to(device)
     scale_factor = 1 / torch.std(z)
-    logger.info(f"Scaling factor set to {scale_factor}.")
 
     if dist.is_initialized():
         dist.barrier()
         dist.all_reduce(scale_factor, op=torch.distributed.ReduceOp.AVG)
     logger.info(f"scale_factor -> {scale_factor}.")
     return scale_factor
+
+
+def setup_validation(args, device: torch.device, global_rank: int, logger: logging.Logger) -> None:
+    """
+    Check whether the autoencoder checkpoint exists and set args.validation_enabled.
+    Broadcasts the result to all distributed ranks so every process agrees.
+    Modifies args.validation_enabled in-place.
+    """
+    args.validation_enabled = False
+    if global_rank == 0:
+        autoencoder_path = getattr(args, 'trained_autoencoder_path', None)
+        if not autoencoder_path:
+            logger.warning("=" * 80)
+            logger.warning("⚠️  VALIDATION IMAGE GENERATION DISABLED ⚠️")
+            logger.warning("=" * 80)
+            logger.warning("Reason: Autoencoder path not configured in config file")
+            logger.warning("Validation image generation requires the autoencoder model.")
+            logger.warning("Please set 'trained_autoencoder_path' in your config.")
+            logger.warning("Validation will be skipped for all epochs.")
+            logger.warning("=" * 80)
+        elif not os.path.exists(autoencoder_path):
+            logger.warning("=" * 80)
+            logger.warning("⚠️  VALIDATION IMAGE GENERATION DISABLED ⚠️")
+            logger.warning("=" * 80)
+            logger.warning(f"Reason: Autoencoder file not found: {autoencoder_path}")
+            logger.warning("Validation image generation requires the autoencoder model.")
+            logger.warning("Please ensure the autoencoder checkpoint exists before running validation.")
+            logger.warning("Validation will be skipped for all epochs.")
+            logger.warning("=" * 80)
+        else:
+            args.validation_enabled = True
+            logger.info(f"Autoencoder file found: {autoencoder_path} (validation will run every {VAL_INTERVAL} epochs)")
+    if dist.is_initialized():
+        validation_enabled_tensor = torch.tensor([1 if args.validation_enabled else 0], dtype=torch.int, device=device)
+        dist.broadcast(validation_enabled_tensor, src=0)
+        args.validation_enabled = bool(validation_enabled_tensor.item())
+
+
+def filter_existing_files(train_files: list, logger: logging.Logger) -> list:
+    """
+    Return only the entries from train_files whose image path exists on disk.
+    Missing files are logged as warnings (RankFilter ensures only rank 0 prints).
+    """
+    valid = []
+    for file_entry in train_files:
+        if not os.path.exists(file_entry['image']):
+            logger.warning(f"File not found, skipping: {file_entry['image']}")
+        else:
+            valid.append(file_entry)
+    logger.info(f"Valid training files: {len(valid)} / {len(train_files)}")
+    return valid
+
+
+def compute_modality_weights(
+    valid_train_files: list,
+    max_weight: float = 10.0,
+    logger: logging.Logger = None,
+) -> tuple:
+    """
+    Compute inverse-frequency sampling weights per modality.
+    Weights are normalized so the most-common modality gets weight 1.0, then
+    capped at max_weight.  Each file entry in valid_train_files is modified
+    in-place by adding a 'sample_weight' key.
+
+    Args:
+        valid_train_files: List of file entry dicts (must have 'modality' key).
+        max_weight: Upper cap on any single modality's weight.
+        logger: If provided, logs the modality distribution.
+
+    Returns:
+        (modality_counts, modality_weights)
+    """
+    modality_counts: dict = {}
+    for file_entry in valid_train_files:
+        mod = file_entry['modality']
+        modality_counts[mod] = modality_counts.get(mod, 0) + 1
+
+    total_files = len(valid_train_files)
+    # Raw inverse-frequency weights
+    raw_weights = {mod: total_files / count for mod, count in modality_counts.items()}
+
+    # Normalize so the most-common modality (smallest raw weight) becomes 1.0
+    min_raw = min(raw_weights.values())
+    weight_norm_factor = 1.0 / min_raw
+
+    # Apply normalization + cap
+    modality_weights = {
+        mod: min(w * weight_norm_factor, max_weight)
+        for mod, w in raw_weights.items()
+    }
+
+    # Assign to each file entry in-place
+    for file_entry in valid_train_files:
+        file_entry['sample_weight'] = modality_weights[file_entry['modality']]
+
+    if logger is not None:
+        logger.info(f"Modality distribution (max_weight={max_weight}):")
+        for mod, count in sorted(modality_counts.items(), key=lambda x: -x[1]):
+            normalized_weight = raw_weights[mod] * weight_norm_factor
+            capped_weight = modality_weights[mod]
+            if normalized_weight > max_weight:
+                logger.info(
+                    f"  {mod}: {count} files (weight: {capped_weight:.4f}, "
+                    f"capped from {normalized_weight:.4f})"
+                )
+            else:
+                logger.info(f"  {mod}: {count} files (weight: {capped_weight:.4f})")
+
+    return modality_counts, modality_weights
 
 
 def create_optimizer(model: torch.nn.Module, lr: float) -> torch.optim.Optimizer:
@@ -420,12 +459,12 @@ def train_one_epoch(
     noise_scheduler: torch.nn.Module,
     num_images_per_batch: int,
     num_train_timesteps: int,
-    device: torch.device,
-    logger: logging.Logger,
-    local_rank: int,
-    amp: bool = True,
-    max_iter: int = None,
-) -> torch.Tensor:
+        device: torch.device,
+        logger: logging.Logger,
+        global_rank: int,
+        amp: bool = True,
+        max_iter: int = None,
+    ) -> torch.Tensor:
     """
     Train the model for one epoch.
 
@@ -443,7 +482,7 @@ def train_one_epoch(
         num_train_timesteps (int): Number of training timesteps.
         device (torch.device): Device to use for training.
         logger (logging.Logger): Logger for logging information.
-        local_rank (int): Local rank for distributed training.
+        global_rank (int): Global rank for distributed training (unique across all nodes).
         amp (bool): Use automatic mixed precision training.
         max_iter (int): Maximum iterations per epoch. If None, process all data.
 
@@ -455,9 +494,9 @@ def train_one_epoch(
     include_body_region = model_for_attr.include_top_region_index_input
     include_modality = model_for_attr.num_class_embeds is not None
 
-    if local_rank == 0:
-        current_lr = optimizer.param_groups[0]["lr"]
-        logger.info(f"Epoch {epoch + 1}, lr {current_lr}.")
+    # RankFilter already ensures only rank 0 logs
+    current_lr = optimizer.param_groups[0]["lr"]
+    logger.info(f"Epoch {epoch + 1}, lr {current_lr}.")
 
     _iter = 0
     loss_torch = torch.zeros(2, dtype=torch.float, device=device)
@@ -480,6 +519,11 @@ def train_one_epoch(
             modality_tensor = augment_modality_label(modality_tensor).to(device)
 
         spacing_tensor = train_data["spacing"].to(device)
+        # Add random scaling to spacing for data augmentation with prob=0.3
+        # Independent scale factors for each axis (x, y, z), sampled uniformly from [0.95, 1.05] (5% variation)
+        if torch.rand(1, device=device) < 0.5:
+            spacing_scale = torch.rand_like(spacing_tensor) * 0.1 + 0.95  # [0.95, 1.05] for each axis
+            spacing_tensor = spacing_tensor * spacing_scale
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -531,6 +575,23 @@ def train_one_epoch(
                 )
 
             loss = loss_pt(model_output.float(), model_gt.float())
+            
+            # Check for NaN loss and terminate if detected
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.error("=" * 80)
+                logger.error("❌ TRAINING TERMINATED: NaN or Inf loss detected!")
+                logger.error("=" * 80)
+                logger.error(f"Epoch: {epoch + 1}, Iteration: {_iter}")
+                logger.error(f"Loss value: {loss.item()}")
+                logger.error("Training cannot continue. Please check:")
+                logger.error("  - Learning rate (may be too high)")
+                logger.error("  - Model architecture")
+                logger.error("  - Data quality")
+                logger.error("  - Gradient clipping")
+                logger.error("=" * 80)
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+                sys.exit(1)
 
         if amp:
             scaler.scale(loss).backward()
@@ -540,12 +601,11 @@ def train_one_epoch(
             loss.backward()
             optimizer.step()
 
-        lr_scheduler.step()
-
         loss_torch[0] += loss.item()
         loss_torch[1] += 1.0
 
-        if local_rank == 0 and _iter % 10 == 0:
+        # RankFilter already ensures only rank 0 logs
+        if _iter % 10 == 0:
             logger.info(
                 "[{0}] epoch {1}, iter {2}/{3}, loss: {4:.4f}, lr: {5:.12f}.".format(
                     str(datetime.now())[:19], epoch + 1, _iter, len(train_loader), loss.item(), current_lr
@@ -564,6 +624,9 @@ def generate_validation_images_for_modalities(
     model_def_path: str,
     args: argparse.Namespace,
     logger: logging.Logger,
+    unet: torch.nn.Module,
+    scale_factor: torch.Tensor,
+    device: torch.device,
 ) -> list:
     """
     Generate validation images for all modalities specified in config.
@@ -617,50 +680,88 @@ def generate_validation_images_for_modalities(
             modality_list = [modality_config]
             logger.info(f"Generating image for single modality: {modality_config}")
         
-        # Generate one image per modality
-        for modality_id in modality_list:
-            # Get modality name for labeling
-            modality_name = modality_id_to_name.get(modality_id, f"mod_{modality_id}")
-            
-            # Create a temporary modified config with single modality
-            temp_model_config = json.loads(json.dumps(model_config))  # Deep copy
-            temp_model_config['diffusion_unet_inference']['modality'] = modality_id
-            
-            # Write temporary config
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp_config:
-                json.dump(temp_model_config, tmp_config, indent=2)
-                tmp_config_path = tmp_config.name
-            
-            try:
-                # Call diff_model_infer with temporary config
-                output_paths = diff_model_infer(
-                    env_config_path=env_config_path,
-                    model_config_path=tmp_config_path,
-                    model_def_path=model_def_path,
-                    num_gpus=1  # Generate on single GPU for validation
-                )
+        # Load inference config to get inference parameters
+        inference_args = load_config(env_config_path, model_config_path, model_def_path)
+        
+        # Load autoencoder (UNet and scale_factor already available from training)
+        autoencoder = define_instance(inference_args, "autoencoder_def").to(device)
+        if not os.path.exists(inference_args.trained_autoencoder_path):
+            logger.warning(f"Autoencoder checkpoint not found: {inference_args.trained_autoencoder_path}")
+            return generated_images
+        
+        try:
+            checkpoint_autoencoder = torch.load(inference_args.trained_autoencoder_path, map_location=device, weights_only=False)
+            if "unet_state_dict" in checkpoint_autoencoder.keys():
+                checkpoint_autoencoder = checkpoint_autoencoder["unet_state_dict"]
+            autoencoder.load_state_dict(checkpoint_autoencoder)
+            logger.info(f"Loaded autoencoder from {inference_args.trained_autoencoder_path}")
+        except Exception as e:
+            logger.warning(f"Failed to load autoencoder: {e}")
+            return generated_images
+        
+        # Get inference parameters
+        output_size = tuple(inference_args.diffusion_unet_inference["dim"])
+        out_spacing = tuple(inference_args.diffusion_unet_inference["spacing"])
+        inference_args.cfg_guidance_scale = inference_args.diffusion_unet_inference["cfg_guidance_scale"]
+        
+        # Calculate divisor for downsample level
+        num_downsample_level = max(
+            1,
+            (
+                len(inference_args.diffusion_unet_def["num_channels"])
+                if isinstance(inference_args.diffusion_unet_def["num_channels"], list)
+                else len(inference_args.diffusion_unet_def["attention_levels"])
+            ),
+        )
+        divisor = 2 ** (num_downsample_level - 2)
+
+        # Free cached training memory before running inference
+        torch.cuda.empty_cache()
+        logger.info("[validation] Cleared CUDA cache before inference.")
+
+        unet.eval()
+        try:
+            # Generate one image per modality
+            for modality_id in modality_list:
+                # Get modality name for labeling
+                modality_name = modality_id_to_name.get(modality_id, f"mod_{modality_id}")
                 
-                # Load the generated image
-                if output_paths:
-                    output_path = output_paths[0]
-                    if os.path.exists(output_path):
-                        # Load the NIfTI file
-                        nii_img = nib.load(output_path)
-                        syn_data = nii_img.get_fdata()
-                        
-                        # Store the generated image data
-                        generated_images.append((modality_id, modality_name, syn_data))
-                        logger.info(f"Generated validation image for {modality_name}")
-                        
-                        # Clean up the generated file
-                        os.unlink(output_path)
-                    else:
-                        logger.warning(f"Generated file not found: {output_path}")
-            
-            finally:
-                # Clean up temporary config file
-                if os.path.exists(tmp_config_path):
-                    os.unlink(tmp_config_path)
+                # Update modality in inference args
+                inference_args.diffusion_unet_inference["modality"] = modality_id
+                
+                try:
+                    # Prepare tensors for this modality
+                    top_region_index_tensor, bottom_region_index_tensor, spacing_tensor, modality_tensor = prepare_tensors(
+                        inference_args, device
+                    )
+                    
+                    # Run inference directly (no distributed setup/teardown)
+                    syn_data = run_inference(
+                        inference_args,
+                        device,
+                        autoencoder,
+                        unet,
+                        scale_factor,
+                        top_region_index_tensor,
+                        bottom_region_index_tensor,
+                        spacing_tensor,
+                        modality_tensor,
+                        output_size,
+                        divisor,
+                        logger,
+                    )
+                    
+                    # Store the generated image data
+                    generated_images.append((modality_id, modality_name, syn_data))
+                    logger.info(f"Generated validation image for {modality_name}")
+                
+                except Exception as e:
+                    logger.warning(f"Failed to generate image for {modality_name}: {str(e)}")
+                    import traceback
+                    logger.warning(traceback.format_exc())
+        finally:
+            unet.train()
+            torch.cuda.empty_cache()
     
     except Exception as e:
         logger.warning(f"Validation image generation failed: {str(e)}")
@@ -685,7 +786,7 @@ def log_validation_images_to_tensorboard(
         tensorboard_writer (SummaryWriter): TensorBoard writer.
         logger (logging.Logger): Logger for logging information.
     """
-    from utils_plot import find_label_center_loc, get_xyz_plot
+    from .utils_plot import find_label_center_loc, get_xyz_plot
     
     for modality_id, modality_name, syn_data in generated_images:
         try:
@@ -715,8 +816,8 @@ def log_validation_images_to_tensorboard(
             )
             
             # Convert from [H, W, 3] numpy array to [3, H, W] tensor for TensorBoard
-            # vis_image is already normalized to uint8 [0, 255]
-            vis_image_tensor = torch.from_numpy(vis_image).permute(2, 0, 1).float() / 255.0
+            # vis_image is already in float32 [0, 1] when mask_bool=False
+            vis_image_tensor = torch.from_numpy(vis_image).permute(2, 0, 1).float()
             
             # Log the combined XYZ view
             tensorboard_writer.add_image(f'val/{modality_name}_xyz', vis_image_tensor, epoch + 1)
@@ -746,50 +847,17 @@ def diff_model_train(
         amp (bool): Use automatic mixed precision training.
     """
     args = load_config(env_config_path, model_config_path, model_def_path)
-    local_rank, world_size, device = initialize_distributed()
+    local_rank, global_rank, world_size, device = initialize_distributed()
     logger = setup_logging("training")
 
     logger.info(f"Using {device} of {world_size}")
     
-    # Check autoencoder file early if validation is enabled (only check once at startup)
-    args.validation_enabled = False
-    
-    if local_rank == 0:
-        autoencoder_path = getattr(args, 'trained_autoencoder_path', None)
-        if not autoencoder_path:
-            logger.warning("=" * 80)
-            logger.warning("⚠️  VALIDATION IMAGE GENERATION DISABLED ⚠️")
-            logger.warning("=" * 80)
-            logger.warning("Reason: Autoencoder path not configured in config file")
-            logger.warning("Validation image generation requires the autoencoder model.")
-            logger.warning("Please set 'trained_autoencoder_path' in your config.")
-            logger.warning("Validation will be skipped for all epochs.")
-            logger.warning("=" * 80)
-            args.validation_enabled = False
-        elif not os.path.exists(autoencoder_path):
-            logger.warning("=" * 80)
-            logger.warning("⚠️  VALIDATION IMAGE GENERATION DISABLED ⚠️")
-            logger.warning("=" * 80)
-            logger.warning(f"Reason: Autoencoder file not found: {autoencoder_path}")
-            logger.warning("Validation image generation requires the autoencoder model.")
-            logger.warning("Please ensure the autoencoder checkpoint exists before running validation.")
-            logger.warning("Validation will be skipped for all epochs.")
-            logger.warning("=" * 80)
-            args.validation_enabled = False
-        else:
-            # Autoencoder file exists - validation enabled
-            args.validation_enabled = True
-            logger.info(f"Autoencoder file found: {autoencoder_path} (validation will run every {VAL_INTERVAL} epochs)")
-    
-    # Broadcast validation_enabled to all ranks in distributed training
-    if dist.is_initialized():
-        validation_enabled_tensor = torch.tensor([1 if args.validation_enabled else 0], dtype=torch.int, device=device)
-        dist.broadcast(validation_enabled_tensor, src=0)
-        args.validation_enabled = bool(validation_enabled_tensor.item())
+    # Check autoencoder availability and broadcast validation_enabled to all ranks
+    setup_validation(args, device, global_rank, logger)
     
     # Initialize TensorBoard writer on main process only
     tensorboard_writer = None
-    if local_rank == 0:
+    if global_rank == 0:
         tensorboard_path = args.tfevent_dir
         Path(tensorboard_path).mkdir(parents=True, exist_ok=True)
         tensorboard_writer = SummaryWriter(tensorboard_path)
@@ -801,18 +869,20 @@ def diff_model_train(
     if image_dim is not None and not isinstance(image_dim, list):
         image_dim = list(image_dim)
 
-    if local_rank == 0:
-        logger.info(f"[config] ckpt_folder -> {args.model_dir}.")
-        logger.info(f"[config] data_root -> {args.embedding_base_dir}.")
-        logger.info(f"[config] data_list -> {args.json_data_list}.")
-        logger.info(f"[config] lr -> {args.diffusion_unet_train['lr']}.")
-        logger.info(f"[config] num_epochs -> {args.diffusion_unet_train['n_epochs']}.")
-        logger.info(f"[config] num_train_timesteps -> {args.noise_scheduler['num_train_timesteps']}.")
-        if image_dim is not None:
-            logger.info(f"[config] image_dim filter -> {image_dim}.")
-        else:
-            logger.info(f"[config] image_dim filter -> None (using all dimensions).")
+    # RankFilter already ensures only rank 0 logs
+    logger.info(f"[config] ckpt_folder -> {args.model_dir}.")
+    logger.info(f"[config] data_root -> {args.embedding_base_dir}.")
+    logger.info(f"[config] data_list -> {args.json_data_list}.")
+    logger.info(f"[config] lr -> {args.diffusion_unet_train['lr']}.")
+    logger.info(f"[config] num_epochs -> {args.diffusion_unet_train['n_epochs']}.")
+    logger.info(f"[config] num_train_timesteps -> {args.noise_scheduler['num_train_timesteps']}.")
+    if image_dim is not None:
+        logger.info(f"[config] image_dim filter -> {image_dim}.")
+    else:
+        logger.info(f"[config] image_dim filter -> None (using all dimensions).")
 
+    # File operation - must be on rank 0 only
+    if global_rank == 0:
         Path(args.model_dir).mkdir(parents=True, exist_ok=True)
 
     unet, scale_factor, start_epoch, optimizer_state_dict, scheduler_state_dict = load_unet(args, device, logger)
@@ -831,61 +901,24 @@ def diff_model_train(
 
     # Load filenames and metadata from JSON(s) - now supports both single and multiple
     train_files = load_filenames(args.json_data_list, args.embedding_base_dir, image_dim=image_dim)
-    if local_rank == 0:
-        logger.info(f"num_files_train: {len(train_files)}")
-        if image_dim is not None:
-            logger.info(f"Filtered by image_dim: {image_dim}")
+    # RankFilter already ensures only rank 0 logs
+    logger.info(f"num_files_train: {len(train_files)}")
+    if image_dim is not None:
+        logger.info(f"Filtered by image_dim: {image_dim}")
 
-    # Filter out non-existent files
-    valid_train_files = []
-    for file_entry in train_files:
-        if not os.path.exists(file_entry['image']):
-            if local_rank == 0:
-                logger.warning(f"File not found, skipping: {file_entry['image']}")
-            continue
-        valid_train_files.append(file_entry)
-    
-    if local_rank == 0:
-        logger.info(f"Valid training files: {len(valid_train_files)}")
-    
-    # Calculate modality-based weights for balanced sampling
-    modality_counts = {}
-    for file_entry in valid_train_files:
-        modality = file_entry['modality']
-        modality_counts[modality] = modality_counts.get(modality, 0) + 1
-    
-    # Compute inverse frequency weights with a maximum threshold
-    total_files = len(valid_train_files)
-    max_weight = 100.0  # Cap maximum weight to prevent extreme oversampling
-    modality_weights = {}
-    for mod, count in modality_counts.items():
-        weight = total_files / count
-        # Apply maximum weight threshold
-        modality_weights[mod] = min(weight, max_weight)
-    
-    # Assign sample_weight to each file entry
-    for file_entry in valid_train_files:
-        file_entry['sample_weight'] = modality_weights[file_entry['modality']]
-    
-    if local_rank == 0:
-        logger.info(f"Modality distribution (max_weight={max_weight}):")
-        for mod, count in sorted(modality_counts.items(), key=lambda x: -x[1]):
-            raw_weight = total_files / count
-            capped_weight = modality_weights[mod]
-            if raw_weight > max_weight:
-                logger.info(f"  {mod}: {count} files (weight: {capped_weight:.4f}, capped from {raw_weight:.4f})")
-            else:
-                logger.info(f"  {mod}: {count} files (weight: {capped_weight:.4f})")
+    # Filter out non-existent files, then compute modality-based sampling weights
+    valid_train_files = filter_existing_files(train_files, logger)
+    compute_modality_weights(valid_train_files, max_weight=10.0, logger=logger)
     
     if dist.is_initialized():
         valid_train_files = partition_dataset(
             data=valid_train_files, shuffle=True, num_partitions=dist.get_world_size(), even_divisible=True
-        )[local_rank]
+        )[global_rank]
 
     # Get use_weighted_sampling from config (default to True if not specified)
     use_weighted_sampling = args.diffusion_unet_train.get("use_weighted_sampling", True)
-    if local_rank == 0:
-        logger.info(f"Weighted sampling: {'enabled' if use_weighted_sampling else 'disabled'}")
+    # RankFilter already ensures only rank 0 logs
+    logger.info(f"Weighted sampling: {'enabled' if use_weighted_sampling else 'disabled'}")
 
     train_loader, sampler = prepare_data(
         valid_train_files,
@@ -904,18 +937,22 @@ def diff_model_train(
     else:
         logger.info(f"Using loaded scale_factor: {scale_factor}.")
     
-    # Create optimizer and load state if available
+    # Create optimizer and load state if available (only when resuming, not training from scratch)
     optimizer = create_optimizer(unet, args.diffusion_unet_train["lr"])
-    if optimizer_state_dict is not None:
+    if start_epoch > 0 and optimizer_state_dict is not None:
         optimizer.load_state_dict(optimizer_state_dict)
         logger.info("Loaded optimizer state from checkpoint.")
+    elif optimizer_state_dict is not None:
+        logger.warning("Skipping optimizer state loading.")
 
     # Create learning rate scheduler
-    total_steps = (args.diffusion_unet_train["n_epochs"] - start_epoch) * len(train_loader.dataset) / args.diffusion_unet_train["batch_size"]
+    total_steps = args.diffusion_unet_train["n_epochs"] - start_epoch
     lr_scheduler = create_lr_scheduler(optimizer, total_steps)
-    if scheduler_state_dict is not None:
+    if start_epoch > 0 and scheduler_state_dict is not None:
         lr_scheduler.load_state_dict(scheduler_state_dict)
         logger.info("Loaded scheduler state from checkpoint.")
+    elif scheduler_state_dict is not None:
+        logger.warning("Skipping lr_scheduler state loading.")
     
     loss_pt = torch.nn.L1Loss()
     scaler = GradScaler("cuda")
@@ -938,12 +975,13 @@ def diff_model_train(
             args.noise_scheduler["num_train_timesteps"],
             device,
             logger,
-            local_rank,
+            global_rank,
             amp=amp,
         )
+        lr_scheduler.step()  # Step LR once per epoch
 
         loss_torch = loss_torch.tolist()
-        if torch.cuda.device_count() == 1 or local_rank == 0:
+        if torch.cuda.device_count() == 1 or global_rank == 0:
             loss_torch_epoch = loss_torch[0] / loss_torch[1]
             logger.info(f"epoch {epoch + 1} average loss: {loss_torch_epoch:.4f}.")
             
@@ -998,6 +1036,9 @@ def diff_model_train(
                     model_def_path,
                     args,
                     logger,
+                    unet,
+                    scale_factor,
+                    device,
                 )
                 
                 # Log to TensorBoard

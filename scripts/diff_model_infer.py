@@ -21,6 +21,7 @@ import nibabel as nib
 import numpy as np
 import torch
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from monai.inferers import sliding_window_inference
 from monai.inferers.inferer import SlidingWindowInferer
 from monai.networks.schedulers import RFlowScheduler
@@ -29,7 +30,7 @@ from tqdm import tqdm
 
 from .diff_model_setting import initialize_distributed, load_config, setup_logging
 from .sample import ReconModel, check_input_ct
-from .utils import define_instance, dynamic_infer
+from .utils import define_instance, dynamic_infer, load_checkpoint
 
 
 def set_random_seed(seed: int) -> int:
@@ -60,19 +61,59 @@ def load_models(args: argparse.Namespace, device: torch.device, logger: logging.
         tuple: Loaded autoencoder, UNet model, and scale factor.
     """
     autoencoder = define_instance(args, "autoencoder_def").to(device)
-    checkpoint_autoencoder = torch.load(args.trained_autoencoder_path)
+    
+    # Check if autoencoder checkpoint exists
+    if not os.path.exists(args.trained_autoencoder_path):
+        raise FileNotFoundError(f"Autoencoder checkpoint not found: {args.trained_autoencoder_path}")
+    
+    try:
+        checkpoint_autoencoder = torch.load(args.trained_autoencoder_path, map_location=device, weights_only=False)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load autoencoder checkpoint from {args.trained_autoencoder_path}: {e}")
+    
     if "unet_state_dict" in checkpoint_autoencoder.keys():
         checkpoint_autoencoder = checkpoint_autoencoder["unet_state_dict"]
     autoencoder.load_state_dict(checkpoint_autoencoder)
     logger.info(f"checkpoints {args.trained_autoencoder_path} loaded.")
 
     unet = define_instance(args, "diffusion_unet_def").to(device)
-    checkpoint = torch.load(f"{args.model_dir}/{args.model_filename}", map_location=device, weights_only=False)
-    unet.load_state_dict(checkpoint["unet_state_dict"], strict=False)
-    logger.info(f"checkpoints {args.model_dir}/{args.model_filename} loaded.")
-
-    scale_factor = checkpoint["scale_factor"]
-    logger.info(f"scale_factor -> {scale_factor}.")
+    
+    # Construct checkpoint path
+    checkpoint_path = f"{args.model_dir}/{args.model_filename}"
+    
+    # Check if checkpoint exists (for inference, we require it)
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"UNet checkpoint not found: {checkpoint_path}")
+    
+    # Check if file is empty
+    if os.path.getsize(checkpoint_path) == 0:
+        raise ValueError(f"Checkpoint file is empty: {checkpoint_path}")
+    
+    # Use load_checkpoint from utils.py which handles both .pt and .safetensors formats
+    try:
+        unet, scale_factor, _, _, _ = load_checkpoint(checkpoint_path, unet, device, logger, strict=False)
+    except Exception as e:
+        # Provide more informative error message
+        error_msg = f"Failed to load checkpoint from {checkpoint_path}: {e}\n"
+        error_msg += f"File exists: {os.path.exists(checkpoint_path)}\n"
+        error_msg += f"File size: {os.path.getsize(checkpoint_path) if os.path.exists(checkpoint_path) else 'N/A'} bytes\n"
+        # Check if file might be text/HTML
+        try:
+            with open(checkpoint_path, 'rb') as f:
+                first_bytes = f.read(100)
+                if first_bytes.startswith(b'<') or first_bytes.startswith(b'<!'):
+                    error_msg += "File appears to be HTML/text, not a PyTorch checkpoint.\n"
+                elif not first_bytes.startswith(b'PK') and not first_bytes.startswith(b'\x80'):  # ZIP or pickle magic
+                    error_msg += "File does not appear to be a valid PyTorch checkpoint format.\n"
+                    if checkpoint_path.endswith('.safetensors'):
+                        error_msg += "Note: This is a .safetensors file. It should be loaded with safetensors library.\n"
+        except:
+            pass
+        raise RuntimeError(error_msg)
+    
+    # Validate that scale_factor was loaded (required for inference)
+    if scale_factor is None:
+        raise ValueError(f"scale_factor is required but not found in checkpoint: {checkpoint_path}")
 
     return autoencoder, unet, scale_factor
 
@@ -136,8 +177,10 @@ def run_inference(
     Returns:
         np.ndarray: Generated synthetic image data.
     """
-    include_body_region = unet.include_top_region_index_input
-    include_modality = unet.num_class_embeds is not None
+    # Access model attributes through .module if wrapped in DDP
+    model_for_attr = unet.module if isinstance(unet, DistributedDataParallel) else unet
+    include_body_region = model_for_attr.include_top_region_index_input
+    include_modality = model_for_attr.num_class_embeds is not None
 
     noise = torch.randn(
         (
@@ -172,7 +215,7 @@ def run_inference(
         total=min(len(all_timesteps), len(all_next_timesteps)),
     )
     cfg_guidance_scale = args.cfg_guidance_scale
-    with torch.amp.autocast("cuda", enabled=True):
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=True):
         for t, next_t in progress_bar:
             # Create a dictionary to store the inputs
             unet_inputs = {
@@ -225,9 +268,13 @@ def run_inference(
         )
         synthetic_images = dynamic_infer(inferer, recon_model, image)
         data = synthetic_images.squeeze().cpu().detach().numpy()
-        a_min, a_max, b_min, b_max = -1000, 1000, 0, 1
-        data = (data - b_min) / (b_max - b_min) * (a_max - a_min) + a_min
-        data = np.clip(data, a_min, a_max)
+        if modality_tensor[0]<8:
+            a_min, a_max, b_min, b_max = -1000, 1000, 0, 1
+            data = (data - b_min) / (b_max - b_min) * (a_max - a_min) + a_min
+            data = np.clip(data, a_min, a_max)
+        else:
+            a_min, a_max, b_min, b_max = 0, 1000, 0, 1
+            data = (data - b_min) / (b_max - b_min) * (a_max - a_min) + a_min
         return np.int16(data)
 
 
@@ -269,7 +316,7 @@ def diff_model_infer(env_config_path: str, model_config_path: str, model_def_pat
         model_def_path (str): Path to the model definition file.
     """
     args = load_config(env_config_path, model_config_path, model_def_path)
-    local_rank, world_size, device = initialize_distributed(num_gpus)
+    local_rank, global_rank, world_size, device = initialize_distributed()
     logger = setup_logging("inference")
     random_seed = set_random_seed(
         args.diffusion_unet_inference["random_seed"] + local_rank

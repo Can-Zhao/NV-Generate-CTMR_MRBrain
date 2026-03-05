@@ -21,12 +21,7 @@ import torch
 import torch.distributed as dist
 from monai.utils import RankFilter
 
-# Try to import yaml, make it optional
-try:
-    import yaml
-    YAML_AVAILABLE = True
-except ImportError:
-    YAML_AVAILABLE = False
+import yaml
 
 
 def setup_logging(logger_name: str = "") -> logging.Logger:
@@ -61,7 +56,7 @@ def load_config_file(config_path: str) -> dict:
         dict: Loaded configuration dictionary
     
     Raises:
-        ValueError: If file extension is not supported or YAML is not installed
+        ValueError: If file extension is not supported
         FileNotFoundError: If config file doesn't exist
     """
     if not os.path.exists(config_path):
@@ -73,11 +68,6 @@ def load_config_file(config_path: str) -> dict:
         with open(config_path, 'r') as f:
             return json.load(f)
     elif file_ext in ['.yaml', '.yml']:
-        if not YAML_AVAILABLE:
-            raise ValueError(
-                f"YAML file detected ({config_path}) but PyYAML is not installed. "
-                "Install it with: pip install pyyaml"
-            )
         with open(config_path, 'r') as f:
             return yaml.safe_load(f)
     else:
@@ -127,10 +117,21 @@ def initialize_distributed() -> tuple:
     by checking for RANK and WORLD_SIZE environment variables.
     
     Works for both single-node and multi-node setups.
+    If process group is already initialized, reuses it instead of initializing again.
 
     Returns:
-        tuple: local_rank, world_size, and device.
+        tuple: local_rank, global_rank, world_size, and device.
     """
+    # Check if process group is already initialized
+    if dist.is_initialized():
+        # Process group already initialized, just get the values
+        global_rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", global_rank))
+        device = torch.device("cuda", local_rank)
+        torch.cuda.set_device(device)
+        return local_rank, global_rank, world_size, device
+    
     # Auto-detect if running under torchrun or other distributed launcher
     if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
         # Multi-GPU distributed training
@@ -148,15 +149,16 @@ def initialize_distributed() -> tuple:
         device = torch.device("cuda", local_rank)
         torch.cuda.set_device(device)
         
-        return local_rank, world_size, device
+        return local_rank, global_rank, world_size, device
     else:
         # Single GPU or CPU mode (not using torchrun)
         local_rank = 0
+        global_rank = 0
         world_size = 1
         device = torch.device("cuda", 0) if torch.cuda.is_available() else torch.device("cpu")
         if torch.cuda.is_available():
             torch.cuda.set_device(device)
-        return local_rank, world_size, device
+        return local_rank, global_rank, world_size, device
 
 def run_torchrun(module, module_args, num_gpus=1):
     num_nodes = 1
