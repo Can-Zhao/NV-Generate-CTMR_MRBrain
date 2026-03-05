@@ -24,11 +24,11 @@ diffusion_unet_train:
   
   # Learning rate for AdamW optimizer
   # - Typical range: 1e-5 to 1e-4 for diffusion models
-  lr: 1.0e-05
+  lr: 5.0e-04
   
   # Number of training epochs
   # - Diffusion models typically need 500-2000 epochs
-  n_epochs: 1000
+  n_epochs: 10000
   
   # Weighted random sampling based on modality distribution
   # - true: Underrepresented modalities are sampled more frequently
@@ -44,29 +44,19 @@ diffusion_unet_train:
   # - Example: [128, 128, 128] for 128³ images only
   # - Example: [256, 256, 128] for 256×256×128 images only
   # - Note: This is configured ONLY in this file (not available as command-line arg)
-  image_dim: 
-  - 128
-  - 128
-  - 128
-
+  image_dim: [128,128,128]
 # Inference Configuration
 # ------------------------------------------------------------------------------
 diffusion_unet_inference:
   # Output volume dimensions [depth, height, width] in pixels
   # - Must match one of the training dimensions for best results
   # - Example: [128, 256, 256] for brain MRI
-  dim:
-  - 128
-  - 128
-  - 128
+  dim: [128,128,128]
   
   # Output voxel spacing [z, y, x] in millimeters
   # - Controls the physical size of the generated image
   # - Example: [1.25, 1.0, 1.0] means 1.25mm slices, 1mm in-plane
-  spacing:
-  - 1.507812
-  - 1.789062
-  - 1.507812
+  spacing: [1.6, 1.6, 1.25]
   
   # Top region index for body region conditioning
   # - 4-element vector [head, chest, abdomen, pelvis]
@@ -104,7 +94,7 @@ diffusion_unet_inference:
   
   # Modality conditioning for generation
   # - Integer ID corresponding to MRI type (see modality_mapping.json)
-  modality: [9, 10, 11, 16, 17, 18, 19]
+  modality: [9, 10, 11, 16, 20]
   
   # Classifier-free guidance scale for conditional generation
   # - Controls how strongly the model follows the conditioning
@@ -115,4 +105,4 @@ diffusion_unet_inference:
   #   15+: Strong guidance (may reduce diversity)
   # - Higher values = more faithful to condition, less diverse
   # - Lower values = more diverse, less faithful to condition
-  cfg_guidance_scale: 15
+  cfg_guidance_scale: 10

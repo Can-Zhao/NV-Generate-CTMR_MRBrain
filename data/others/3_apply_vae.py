@@ -30,7 +30,7 @@ from vae_utils import (
     load_autoencoder,
     create_preprocessing_transforms,
     process_single_image,
-    POSSIBLE_SIZES
+    cleanup_temp_files,
 )
 
 
@@ -47,11 +47,11 @@ def main():
     parser.add_argument("--no_skip_existing", "--no-skip-existing", dest="no_skip_existing", action="store_true",
                         help="Reprocess all files (don't skip existing)")
     args = parser.parse_args()
-    
+
     # Initialize distributed training
     if dist.is_initialized():
         dist.destroy_process_group()
-    
+
     dist.init_process_group(backend="nccl", init_method="env://")
     global_rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -60,11 +60,11 @@ def main():
     local_rank = int(os.environ.get("LOCAL_RANK", global_rank))
     device = torch.device("cuda", local_rank)
     torch.cuda.set_device(device)
-    
+
     set_determinism(seed=42)
-    
+
     skip_existing = not args.no_skip_existing
-    
+
     if global_rank == 0:
         print("="*80)
         print("Generic VAE Application (using vae_utils)")
@@ -76,30 +76,35 @@ def main():
         print(f"Skip existing: {skip_existing}")
         print(f"World size: {world_size}")
         print("="*80)
-    
+
     # Download model (only on rank 0)
     download_autoencoder_model(local_rank=global_rank)
     dist.barrier()  # Wait for download to complete
-    
+
+    # Clean up stale temp files from any previous interrupted run
+    if global_rank == 0:
+        cleanup_temp_files(args.output_root)
+    dist.barrier()
+
     # Load autoencoder
     if global_rank == 0:
         print("\n" + "="*80)
         print("Loading autoencoder...")
         print("="*80)
     autoencoder = load_autoencoder(device=device, num_splits=args.num_splits)
-    
+
     # Create preprocessing transforms
     transforms = create_preprocessing_transforms()
-    
+
     # Load input JSON
     if global_rank == 0:
         print("\n" + "="*80)
         print("Loading input JSON...")
         print("="*80)
-    
+
     with open(args.input_json, 'r') as f:
         data = json.load(f)
-    
+
     # Combine training, testing, and validation images
     all_images = []
     if "training" in data:
@@ -108,7 +113,7 @@ def main():
         all_images.extend(data["testing"])
     if "validation" in data:
         all_images.extend(data["validation"])
-    
+
     if global_rank == 0:
         print(f"Total images in JSON: {len(all_images)}")
         if "training" in data:
@@ -117,43 +122,46 @@ def main():
             print(f"  Testing: {len(data['testing'])}")
         if "validation" in data:
             print(f"  Validation: {len(data['validation'])}")
-    
-    # Distribute images across GPUs
+
+    # Distribute images across GPUs using global_rank (not local_rank).
+    # local_rank is only the GPU index within a single node (0–7).
+    # global_rank is the unique rank across ALL nodes, which is what we need
+    # to partition work correctly in multi-node jobs.
     images_per_gpu = len(all_images) // world_size
-    start_idx = local_rank * images_per_gpu
-    end_idx = start_idx + images_per_gpu if local_rank < world_size - 1 else len(all_images)
+    start_idx = global_rank * images_per_gpu
+    end_idx = start_idx + images_per_gpu if global_rank < world_size - 1 else len(all_images)
     my_images = all_images[start_idx:end_idx]
-    
+
     if global_rank == 0:
-        print(f"GPU {local_rank}: Processing images {start_idx} to {end_idx-1} ({len(my_images)} images)")
+        print(f"GPU {global_rank}: Processing images {start_idx} to {end_idx-1} ({len(my_images)} images)")
         print("="*80)
-    
+
     # Process images
     total_success = 0
     total_errors = 0
     total_skipped = 0
     all_error_messages = []
-    
+
     if global_rank == 0:
         print("\n" + "="*80)
         print("Processing images...")
         print("="*80)
-    
+
     for item in tqdm(my_images, desc=f"GPU {global_rank}", disable=(global_rank != 0)):
         # Extract image path from item
         if isinstance(item, dict):
             image_rel_path = item.get("image", "")
         else:
             image_rel_path = str(item)
-        
+
         if not image_rel_path:
             all_error_messages.append("Empty image path in JSON item")
             total_errors += 1
             continue
-        
+
         # Build full path
         image_full_path = os.path.join(args.data_root, image_rel_path)
-        
+
         # Use shared process_single_image function
         num_success, num_errors, num_skipped, error_messages = process_single_image(
             image_full_path=image_full_path,
@@ -163,34 +171,34 @@ def main():
             autoencoder=autoencoder,
             device=device,
             num_splits=args.num_splits,
-            skip_existing=skip_existing
+            skip_existing=skip_existing,
         )
-        
+
         total_success += num_success
         total_errors += num_errors
         total_skipped += num_skipped
         all_error_messages.extend(error_messages)
-    
+
     # Print summary for this GPU
     if global_rank == 0:
         print("\n" + "="*80)
-        print(f"GPU {local_rank} Summary:")
+        print(f"GPU {global_rank} Summary:")
         print("="*80)
         print(f"Successfully encoded: {total_success}")
         print(f"Skipped (existing/too large): {total_skipped}")
         print(f"Errors: {total_errors}")
-        
+
         if all_error_messages:
             print("\nError messages:")
             for msg in all_error_messages[:10]:  # Show first 10 errors
                 print(f"  - {msg}")
             if len(all_error_messages) > 10:
                 print(f"  ... and {len(all_error_messages) - 10} more errors")
-        
+
         print("="*80)
         print("Done!")
         print("="*80)
-    
+
     # Don't call destroy_process_group() - it can hang in multi-node setups
     # The process group will be cleaned up when the script exits
 

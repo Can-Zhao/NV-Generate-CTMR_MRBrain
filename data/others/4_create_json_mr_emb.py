@@ -27,37 +27,59 @@ from collections import defaultdict
 def infer_mri_class_from_filename(filename):
     """
     Infer MRI class from filename patterns.
-    
+
+    Checks are ordered from most specific to most general to avoid false matches.
+
     Examples:
-        "sub-0001_run-1_T1w.nii.gz" -> "mri_t1"
-        "sub-0001_T2w.nii.gz" -> "mri_t2"
-        "sub-0001_FLAIR.nii.gz" -> "mri_flair"
-        "sub-0001_T1ce.nii.gz" -> "mri_t1c"
-    
+        "sub-0001_run-1_T1w.nii.gz"          -> "mri_t1"
+        "sub-0001_T2w.nii.gz"                 -> "mri_t2"
+        "sub-0001_FLAIR.nii.gz"               -> "mri_flair"
+        "sub-0001_T1ce.nii.gz"                -> "mri_t1c"
+        "sub-strokecase0158_ses-0001_adc.nii" -> "mri_adc"
+        "sub-strokecase0158_ses-0001_dwi.nii" -> "mri_dwi"
+        "sub-0001_swi.nii.gz"                 -> "mri_swi"
+        "sub-0001_mra.nii.gz"                 -> "mri_mra"
+
     Args:
-        filename: Image filename
-        
+        filename: Image filename (basename or full path).
+
     Returns:
-        Class string (mri_t1, mri_t2, mri_flair, mri_t1c, mri_t2c, mri_flairc, or mri)
+        Class string: one of mri_t1, mri_t2, mri_flair, mri_t1c, mri_t2c,
+        mri_flairc, mri_adc, mri_dwi, mri_swi, mri_mra, or mri (default).
     """
     filename_upper = filename.upper()
-    
-    # Check for contrast-enhanced first (more specific)
+
+    # ── Contrast-enhanced (check before plain T1/T2/FLAIR) ───────────────────
     if 'T1CE' in filename_upper or 'T1_CE' in filename_upper or 'T1-CE' in filename_upper:
         return "mri_t1c"
-    elif 'T2CE' in filename_upper or 'T2_CE' in filename_upper or 'T2-CE' in filename_upper:
+    if 'T2CE' in filename_upper or 'T2_CE' in filename_upper or 'T2-CE' in filename_upper:
         return "mri_t2c"
-    elif 'FLAIRCE' in filename_upper or 'FLAIR_CE' in filename_upper or 'FLAIR-CE' in filename_upper:
+    if 'FLAIRCE' in filename_upper or 'FLAIR_CE' in filename_upper or 'FLAIR-CE' in filename_upper:
         return "mri_flairc"
-    # Then check for non-contrast
-    elif 'T1W' in filename_upper or '_T1.' in filename_upper or '_T1_' in filename_upper:
-        return "mri_t1"
-    elif 'T2W' in filename_upper or '_T2.' in filename_upper or '_T2_' in filename_upper:
-        return "mri_t2"
-    elif 'FLAIR' in filename_upper:
+
+    # ── Diffusion (check ADC before DWI; both before T2 to avoid false match) ─
+    # ADC maps are derived from DWI but have a distinct appearance.
+    if '_ADC' in filename_upper or '-ADC' in filename_upper or filename_upper.endswith('ADC'):
+        return "mri_adc"
+    if '_DWI' in filename_upper or '-DWI' in filename_upper or filename_upper.endswith('DWI'):
+        return "mri_dwi"
+
+    # ── Susceptibility / angiography ─────────────────────────────────────────
+    if '_SWI' in filename_upper or '-SWI' in filename_upper or filename_upper.endswith('SWI'):
+        return "mri_swi"
+    if '_MRA' in filename_upper or '-MRA' in filename_upper or filename_upper.endswith('MRA'):
+        return "mri_mra"
+
+    # ── Structural (non-contrast) ─────────────────────────────────────────────
+    # FLAIR before T2 because FLAIR filenames may also contain T2-like tokens.
+    if 'FLAIR' in filename_upper:
         return "mri_flair"
-    else:
-        return "mri"  # Default
+    if 'T1W' in filename_upper or '_T1.' in filename_upper or '_T1_' in filename_upper:
+        return "mri_t1"
+    if 'T2W' in filename_upper or '_T2.' in filename_upper or '_T2_' in filename_upper:
+        return "mri_t2"
+
+    return "mri"  # Unknown / fallback
 
 
 def extract_size_from_filename(filename):

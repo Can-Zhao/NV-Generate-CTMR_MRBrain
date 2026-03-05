@@ -23,9 +23,9 @@ from functools import partial
 from tqdm import tqdm
 
 # Configuration
-INPUT_JSON = "./jsons/dataset_MR-RATE_brain_mask_pairs.json"
-DATA_ROOT = "/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_monai/datasets/MR-RATE/hyperlinks_removed/datasets--Forithmus--MR-RATE/snapshots/6c419668310c03d150b7904821a5b41ed1123318/nvidia_1000_mri"
-OUTPUT_ROOT = "/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_monai/datasets/MR-RATE/hyperlinks_removed/datasets--Forithmus--MR-RATE/snapshots/6c419668310c03d150b7904821a5b41ed1123318/nvidia_1000_mri_skull_stripped"
+INPUT_JSON = "/lustre/fsw/portfolios/healthcareeng/users/canz/code/jsons/dataset_MR-RATE_brain_mask_pairs.json"
+DATA_ROOT = "/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_monai/datasets/MR-RATE/MR-RATE_20260227_unzip/mri/"
+OUTPUT_ROOT = "/lustre/fsw/portfolios/healthcareeng/projects/healthcareeng_monai/datasets/MR-RATE/MR-RATE_20260227_unzip_skull_stripped/mri/"
 
 
 def load_json(json_path):
@@ -64,8 +64,16 @@ def apply_brain_mask_single(pair, data_root, output_root, skip_existing=True):
         mask_rel_path = pair['brain_mask']
         
         # Construct full paths
+        # Input paths: data_root + relative_path 
+        # Example: mri/batch00/3159536/img/3159536_flair-raw-sag.nii.gz
         image_full_path = os.path.join(data_root, image_rel_path)
         mask_full_path = os.path.join(data_root, mask_rel_path)
+        
+        # Output path: output_root + same relative_path to maintain EXACT folder structure
+        # This ensures output structure matches input structure exactly:
+        # Input:  mri/batch00/3159536/img/3159536_flair-raw-sag.nii.gz
+        # Output: mri_skull_stripped/batch00/3159536/img/3159536_flair-raw-sag.nii.gz
+        # The relative path from JSON (batch00/3159536/img/...) is preserved
         output_full_path = os.path.join(output_root, image_rel_path)
         
         # Check if input files exist
@@ -120,7 +128,7 @@ def apply_brain_mask_single(pair, data_root, output_root, skip_existing=True):
             # Clean up temp file if save failed
             if os.path.exists(temp_output_path):
                 os.remove(temp_output_path)
-            raise e
+            return (False, f"Failed to save output: {str(e)}", pair)
         
         return (True, "Success", pair)
         
@@ -202,8 +210,11 @@ def process_dataset_parallel(num_workers=None, skip_existing=True):
     if failed_pairs:
         print("\n⚠️  Failed pairs:")
         for pair, error_msg in failed_pairs[:10]:  # Show first 10
-            print(f"  Subject: {pair['subject_id']}, Space: {pair['space']}, "
-                  f"Modality: {pair.get('modality_key', 'N/A')}")
+            subject_id = pair.get('subject_id', 'N/A')
+            modality = pair.get('modality_key', 'N/A')
+            image_path = pair.get('image', 'N/A')
+            print(f"  Subject: {subject_id}, Modality: {modality}")
+            print(f"    Image: {image_path}")
             print(f"    Error: {error_msg}")
         if len(failed_pairs) > 10:
             print(f"  ... and {len(failed_pairs) - 10} more failed pairs")

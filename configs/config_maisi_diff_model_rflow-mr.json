@@ -7,14 +7,14 @@
     },
     "diffusion_unet_inference": {
         "dim": [
-            128,
             256,
-            256
+                256,
+                256
         ],
         "spacing": [
-            1.25,
-            1.0,
-            1.0
+            0.7810270758298583,
+                0.9765624558974346,
+                0.9765624528637317
         ],
         "top_region_index": [
             0,
@@ -28,9 +28,9 @@
             1,
             0
         ],
-        "random_seed": 0,
+        "random_seed": 1234,
         "num_inference_steps": 30,
-        "modality": 9,
+        "modality": 11,
         "cfg_guidance_scale": 15
     }
 }
